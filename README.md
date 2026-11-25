@@ -28,8 +28,10 @@ wire ─► L3⁻¹ AES-GCM (verify tag) ─► L2⁻¹ ─► L1⁻¹ ─► pl
 
 ## Setup (on each laptop)
 
+Use Python 3.10+ with Tk 8.6 or newer. On macOS the built-in `/usr/bin/python3` ships Tk 8.5, which draws blank windows, so install one with Tk instead: `brew install python@3.12 python-tk@3.12`, then use `python3.12` below.
+
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 

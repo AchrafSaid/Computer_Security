@@ -129,6 +129,37 @@ def test_relay_observe_passes_through(ids):
     assert any("entropy=" in l for l in logs)
 
 
+def test_relay_hears_noise_not_speech(ids):
+    """The middle laptop captures roughly as much 'audio' as was sent, but it is
+    ciphertext: uncorrelated with the original signal and close to max entropy."""
+    import numpy as np
+    from securevoice.relay import InspectionRelay, shannon_entropy
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(ids[0], "alice"), hd.peer(ids[1], "bob")
+    dport, t, _ = start_dest(dst)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "observe", capture_dir=None, on_log=lambda s: None)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+    pcm = tone(3.0, 440)
+    src.send_voice(pcm, RATE)
+    assert wait_for(lambda: hd.voices)
+    src.close(); dst.close()
+    assert wait_for(lambda: relay.done.is_set(), 5)
+
+    heard = [m for m in relay.intercepted if m.direction == "A->B"]
+    assert len(heard) == 1
+    m = heard[0]
+    assert abs(m.seconds() - 3.0) < 0.2                      # about as long as the speech
+    assert shannon_entropy(bytes(m.data)) > 7.99              # looks random
+    orig = np.frombuffer(pcm, dtype="<i2").astype(float)
+    noise = np.frombuffer(bytes(m.data[:len(pcm)]), dtype="<i2").astype(float)
+    n = min(len(orig), len(noise))
+    corr = abs(np.corrcoef(orig[:n], noise[:n])[0, 1])
+    assert corr < 0.05                                        # no trace of the original signal
+
+
 @pytest.mark.parametrize("mode,expected", [
     ("tamper", "integrity check failed"),
     ("replay", "replayed"),

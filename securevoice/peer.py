@@ -61,7 +61,11 @@ class Peer:
         self.on_log(f"Listening on {host}:{srv.getsockname()[1]} ...")
         if ready:
             ready.set()
-        conn, addr = srv.accept()
+        try:
+            conn, addr = srv.accept()
+        finally:
+            srv.close()          # free the port as soon as the single peer is accepted
+            self._listener = None
         conn.settimeout(None)
         self.on_log(f"Connection from {addr[0]}:{addr[1]}")
         self._start(P.handshake_responder(conn, self.identity, self.name, expected_peer_fp))

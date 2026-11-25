@@ -249,8 +249,38 @@ class RelayApp(_QueuedApp):
         ttk.Label(cfg, text=f"My IP: {local_ip()}").grid(row=5, column=0, sticky="w")
         self.btn = ttk.Button(cfg, text="Start relay", command=self.start)
         self.btn.grid(row=5, column=1, sticky="e")
+
+        heard = ttk.LabelFrame(f, text="Intercepted voice (what the middle laptop hears)", padding=8)
+        heard.pack(fill="x", pady=8)
+        self.heard = tk.Listbox(heard, height=5)
+        self.heard.pack(side="left", fill="both", expand=True)
+        hb = ttk.Frame(heard)
+        hb.pack(side="left", padx=6)
+        ttk.Button(hb, text="▶ Play", command=self.play_intercepted).pack(fill="x")
+        ttk.Button(hb, text="■ Stop", command=audio.stop_playback).pack(fill="x", pady=4)
+        self.relay = None
+
         self.log = self._make_log(f)
         self.log.pack(fill="both", expand=True, pady=(8, 0))
+        self.root.after(1000, self._refresh_heard)
+
+    def _refresh_heard(self):
+        if self.relay:
+            items = list(self.relay.intercepted)
+            self.heard.delete(0, "end")
+            for m in items:
+                self.heard.insert("end", m.label())
+        self.root.after(1000, self._refresh_heard)
+
+    def play_intercepted(self):
+        sel = self.heard.curselection()
+        if not self.relay or not self.relay.intercepted:
+            return
+        m = self.relay.intercepted[sel[0] if sel else -1]
+        self.post(self._append, self.log,
+                  f"[relay] playing intercepted ciphertext as audio ({m.seconds():.1f}s) – "
+                  "noise only, the speech cannot be recovered without the session key")
+        audio.play(m.as_pcm())
 
     def start(self):
         try:
@@ -260,6 +290,7 @@ class RelayApp(_QueuedApp):
         except ValueError as e:
             messagebox.showerror("Settings", str(e))
             return
+        self.relay = relay
         self.btn.configure(state="disabled")
 
         def run():
