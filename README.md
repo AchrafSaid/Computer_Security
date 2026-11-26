@@ -66,6 +66,7 @@ A command-line relay is also available:
 ```
 - `tests/test_unit.py`: each layer, the combined cipher, RSA wrap and sign, key derivation, and framing.
 - `tests/test_integration.py`: real localhost TCP connections. Covers two-way sending at the same time, a 60-second message, fingerprint mismatch, and the relay in observe, tamper, replay and drop modes.
+- `tests/test_analysis.py`: the cryptanalysis. Ciphertext-only, known-plaintext and chosen-plaintext attacks all break the classical layers, and all three fail once AES is added.
 
 ## Project layout
 
@@ -76,10 +77,42 @@ securevoice/protocol.py        framing, handshake, SecureChannel (seq/replay che
 securevoice/peer.py            two-way voice peer (reader thread + thread-safe send)
 securevoice/relay.py           inspection relay for the middle laptop
 securevoice/audio.py           mic recording / playback / WAV
-securevoice/gui.py             Tkinter GUIs
+securevoice/gui.py             Tkinter GUIs (peer, relay, cryptanalysis lab)
+securevoice/analysis.py        offline cryptanalysis (statistics + three attack types)
 run.py                         entry point
 ```
 
 ## Known limitations
 - Without a pinned fingerprint, the first connection trusts whatever key is presented (trust on first use). The GUI warns about this. Always pin fingerprints for the demo.
 - The Affine and transposition layers are weak on their own. Security comes from AES-GCM, and the classical layers are there for the course's layered-model requirement and for the cryptanalysis discussion.
+
+## Cryptanalysis (for the report)
+
+Your recording is encrypted with 1, 2 and 3 layers, using fresh random keys for each run. Three classic attacks are then run against each case. This is an offline lab: nothing is sent on the network.
+
+- **GUI:** `.venv/bin/python run.py lab`, or the **Cryptanalysis lab…** button in the relay window.
+- **Command line:** `.venv/bin/python scripts/cryptanalysis_report.py received/<your-message>.wav`
+
+| Attack | What the attacker has | How the classical layers fall |
+|---|---|---|
+| **Ciphertext-only** | only the ciphertext | **Brute force + statistics:** tries all 32,768 Affine keys and scores each by the byte histogram. In speech the high bytes are mostly `0x00`/`0xFF`. **Pattern:** tries all 8! = 40,320 column orders and keeps the smoothest output. |
+| **Known-plaintext** | the first 0.5 s of audio and its ciphertext | Two byte pairs solve `a = (y1−y2)(x1−x2)⁻¹`, `b = y1 − a·x1 (mod 256)`. Matching the known bytes against each ciphertext block reveals the column order in 64 checks. |
+| **Chosen-plaintext** | can get chosen messages encrypted | All-`0x00` gives `b`, all-`0x01` gives `a+b`. A column-marker message then shows the column order directly. |
+
+Example result (8.4 s recording):
+
+| Layers | Entropy | Chi-square | Ciphertext-only | Known-plaintext | Chosen-plaintext |
+|---|---|---|---|---|---|
+| Plaintext | 6.24 | 3,579,319 | – | – | – |
+| Affine | 6.24 | 3,579,319 | broken, 100% | broken, 100% | broken, 100% |
+| Affine + Transposition | 6.24 | 3,579,261 | broken, 100% (~3 s) | broken, 100% | broken, 100% |
+| Affine + Transposition + AES | 8.00 | ≈220 | **0%** | **0%** | **0%** |
+
+**Why AES stops all three:**
+- AES-GCM output is statistically random, so the ciphertext-only attacks have nothing to measure.
+- Known plaintext–ciphertext pairs don't reveal the AES key.
+- Every frame uses a new nonce, so the same chosen message encrypts differently each time.
+
+**Outputs:**
+- In `analysis/`: `results.csv` (statistics), `attacks.csv` (attack outcomes) and `histograms.csv`. Use these for charts.
+- `recovered_layers<N>_<attack>.wav`: what the attacker ends up with.

@@ -9,6 +9,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from . import analysis
 from . import audio
 from .keys import Identity
 from .peer import DEFAULT_PORT, Peer, VoiceMessage
@@ -258,6 +259,7 @@ class RelayApp(_QueuedApp):
         hb.pack(side="left", padx=6)
         ttk.Button(hb, text="▶ Play", command=self.play_intercepted).pack(fill="x")
         ttk.Button(hb, text="■ Stop", command=audio.stop_playback).pack(fill="x", pady=4)
+        ttk.Button(hb, text="Cryptanalysis lab…", command=lambda: open_lab(self.root)).pack(fill="x")
         self.relay = None
 
         self.log = self._make_log(f)
@@ -300,6 +302,156 @@ class RelayApp(_QueuedApp):
                 self.post(self._append, self.log, f"[relay] error: {e}")
             self.post(lambda: self.btn.configure(state="normal"))
         threading.Thread(target=run, daemon=True).start()
+
+
+ATTACK_INFO = {
+    "Ciphertext-only": "The attacker has only the ciphertext, exactly what the middle laptop "
+                       "captures. Tools: brute force over all keys, byte statistics, and a "
+                       "pattern (smoothness) search over all column orders.",
+    "Known-plaintext": "The attacker also knows the first {known:.1f} s of the original audio "
+                       "(for example a standard greeting) and lines it up with the ciphertext.",
+    "Chosen-plaintext": "The attacker can get messages of their choice encrypted with the same "
+                        "keys (for example by playing chosen sounds into the sender's microphone) "
+                        "and studies the output: all 0x00, all 0x01, then a column-marker pattern.",
+}
+
+
+class LabApp(_QueuedApp):
+    """Offline cryptanalysis lab: encrypts one of your recordings with 1, 2 and 3
+    layers and runs ciphertext-only, known-plaintext and chosen-plaintext attacks."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        root.title("SecureVoice – Cryptanalysis lab (offline, on your own recording)")
+        self.results, self.pcm, self.rate, self.ch = [], b"", 16000, 1
+        f = ttk.Frame(root, padding=10)
+        f.pack(fill="both", expand=True)
+
+        cfg = ttk.LabelFrame(f, text="Experiment", padding=8)
+        cfg.pack(fill="x")
+        self.path = tk.StringVar(value=self._latest_recording())
+        self.secs = tk.StringVar(value="20")
+        self.known = tk.StringVar(value="0.5")
+        ttk.Label(cfg, text="Recording (WAV)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cfg, textvariable=self.path, width=46).grid(row=0, column=1, columnspan=3, sticky="we")
+        ttk.Button(cfg, text="Browse…", command=self._browse).grid(row=0, column=4, padx=4)
+        ttk.Label(cfg, text="Use first (s)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(cfg, textvariable=self.secs, width=6).grid(row=1, column=1, sticky="w")
+        ttk.Label(cfg, text="Attacker knows first (s)").grid(row=1, column=2, sticky="e")
+        ttk.Entry(cfg, textvariable=self.known, width=6).grid(row=1, column=3, sticky="w")
+        self.run_btn = ttk.Button(cfg, text="Run all attacks", command=self.run)
+        self.run_btn.grid(row=1, column=4, padx=4)
+        self.status = ttk.Label(cfg, text="Keys are random for each run. Nothing is sent on the network.")
+        self.status.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+        cols = ("layers", "attack", "result", "recovered", "time")
+        self.tree = ttk.Treeview(f, columns=cols, show="headings", height=9)
+        for c, title, w in zip(cols, ("Layers", "Attack", "Result", "Voice recovered", "Time"),
+                               (230, 140, 120, 120, 70)):
+            self.tree.heading(c, text=title)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.tag_configure("broken", foreground="#d33")
+        self.tree.tag_configure("safe", foreground="#2a2")
+        self.tree.pack(fill="x", pady=8)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_detail())
+
+        btns = ttk.Frame(f)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="▶ Play original", command=self.play_original).pack(side="left")
+        ttk.Button(btns, text="▶ Play what the attacker recovered", command=self.play_result).pack(side="left", padx=6)
+        ttk.Button(btns, text="■ Stop", command=audio.stop_playback).pack(side="left")
+
+        self.detail = scrolledtext.ScrolledText(f, height=8, wrap="word", font=("Menlo", 11), state="disabled")
+        self.detail.pack(fill="both", expand=True, pady=(8, 0))
+
+    @staticmethod
+    def _latest_recording() -> str:
+        if not os.path.isdir("received"):
+            return ""
+        wavs = [os.path.join("received", n) for n in os.listdir("received") if n.endswith(".wav")]
+        return max(wavs, key=os.path.getmtime) if wavs else ""
+
+    def _browse(self):
+        p = filedialog.askopenfilename(filetypes=[("WAV audio", "*.wav")], initialdir="received")
+        if p:
+            self.path.set(p)
+
+    def run(self):
+        try:
+            pcm, rate, ch, width = audio.load_wav(self.path.get())
+            secs, known = float(self.secs.get()), float(self.known.get())
+        except Exception as e:
+            messagebox.showerror("Lab", f"Cannot load recording: {e}")
+            return
+        if width != 2:
+            messagebox.showerror("Lab", "Only 16-bit WAV files are supported.")
+            return
+        self.pcm = pcm[: int(rate * secs) * ch * 2]
+        self.rate, self.ch, self.known_secs = rate, ch, known
+        self.results = []
+        self.tree.delete(*self.tree.get_children())
+        self.run_btn.configure(state="disabled")
+        self.status.configure(text="Running… (the two pattern searches take a few seconds each)")
+        known_bytes = int(rate * known) * ch * 2
+
+        def work():
+            try:
+                analysis.run_attacks(self.pcm, known_bytes, on_result=lambda r: self.post(self._add, r))
+                self.post(self.status.configure, {"text": "Done. Select a row for details; play the result to hear it."})
+            except Exception as e:
+                self.post(self.status.configure, {"text": f"Error: {e}"})
+            self.post(lambda: self.run_btn.configure(state="normal"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _add(self, r):
+        self.results.append(r)
+        self.tree.insert("", "end", iid=str(len(self.results) - 1), tags=("broken" if r["success"] else "safe",),
+                         values=(r["case"], r["attack"], "BROKEN" if r["success"] else "resisted",
+                                 f"{r['recovered']:.0%}", f"{r['secs']:.2f}s"))
+
+    def _selected(self):
+        sel = self.tree.selection()
+        return self.results[int(sel[0])] if sel else None
+
+    def _show_detail(self):
+        r = self._selected()
+        if not r:
+            return
+        text = (f"{r['attack']} attack on {r['case']}\n\n"
+                f"Attacker's position: {ATTACK_INFO[r['attack']].format(known=self.known_secs)}\n\n"
+                f"What happened: {r['detail']}.\n\n"
+                f"Key the attacker found: {r['key']}\nReal key:              {r['real_key']}"
+                + ("\n(A different but equivalent Affine key gives the same audio with inverted polarity.)"
+                   if r["success"] and r["key"].split(" cols")[0] != r["real_key"].split(" cols")[0] else "")
+                + f"\n\nVoice recovered: {r['recovered']:.0%} (correlation with the original).")
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.insert("end", text)
+        self.detail.configure(state="disabled")
+
+    def play_original(self):
+        if self.pcm:
+            audio.play(self.pcm, self.rate, self.ch)
+
+    def play_result(self):
+        r = self._selected()
+        if not r:
+            return
+        import numpy as np
+        pcm = r["audio"]
+        if not r["success"]:                     # noise: play at a quarter volume
+            pcm = (np.frombuffer(pcm, dtype="<i2") // 4).astype("<i2").tobytes()
+        audio.play(pcm, self.rate, self.ch)
+
+
+def open_lab(master=None):
+    LabApp(tk.Toplevel(master) if master else tk.Tk())
+
+
+def run_lab():
+    root = tk.Tk()
+    LabApp(root)
+    root.mainloop()
 
 
 def run_peer(key_path: str):
