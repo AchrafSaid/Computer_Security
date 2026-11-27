@@ -201,6 +201,12 @@ class PeerApp(_QueuedApp):
             self._send(pcm, rate, ch, width)
 
     def _send(self, pcm, rate, ch, width):
+        secs = len(pcm) / (rate * ch * width)
+        if not pcm:
+            self.logmsg("Nothing was recorded – check the microphone permission for Terminal/Python")
+            return
+        self.logmsg(f"Recorded {secs:.1f}s – encrypting and sending…")
+
         def run():
             try:
                 self.peer.send_voice(pcm, rate, ch, width)

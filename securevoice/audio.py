@@ -15,26 +15,41 @@ class Recorder:
         self.sample_rate, self.channels = sample_rate, channels
         self._chunks = []
         self._stream = None
+        self._recording = False
         self._lock = threading.Lock()
 
     def _cb(self, indata, frames, t, status):
         with self._lock:
-            self._chunks.append(bytes(indata))
+            if self._recording:
+                self._chunks.append(bytes(indata))
 
     def start(self) -> None:
         import sounddevice as sd
-        self._chunks = []
+        with self._lock:
+            self._chunks = []
+            self._recording = True
         self._stream = sd.RawInputStream(samplerate=self.sample_rate, channels=self.channels,
                                          dtype="int16", callback=self._cb)
         self._stream.start()
 
     def stop(self) -> bytes:
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        """Returns the recording immediately. The audio device is shut down in a
+        background thread: on macOS, stopping a CoreAudio stream can block for a
+        long time (e.g. with Bluetooth headsets), which used to freeze the GUI."""
         with self._lock:
-            return b"".join(self._chunks)
+            self._recording = False
+            data = b"".join(self._chunks)
+            self._chunks = []
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            def shutdown():
+                try:
+                    stream.abort()
+                    stream.close()
+                except Exception:
+                    pass
+            threading.Thread(target=shutdown, daemon=True).start()
+        return data
 
 
 def play(pcm: bytes, sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> None:

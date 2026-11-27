@@ -95,8 +95,11 @@ class Peer:
                 "size": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
         ch.send(bytes([K_BEGIN]) + json.dumps(meta).encode())
         mid = msg_id.to_bytes(4, "big")
-        for i in range(0, len(pcm), CHUNK):
+        total = (len(pcm) + CHUNK - 1) // CHUNK
+        for n, i in enumerate(range(0, len(pcm), CHUNK), 1):
             ch.send(bytes([K_CHUNK]) + mid + pcm[i:i + CHUNK])
+            if n % 20 == 0 and n < total:
+                self.on_log(f"  sending… {n}/{total} chunks")
         ch.send(bytes([K_END]) + mid)
         self.on_log(f"Sent voice message #{msg_id}: {len(pcm)} bytes, "
                     f"{(len(pcm) + CHUNK - 1) // CHUNK} encrypted chunks")
