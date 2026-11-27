@@ -4,6 +4,7 @@ the Tk thread through a queue."""
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 import tkinter as tk
@@ -14,6 +15,105 @@ from . import audio
 from .keys import Identity
 from .peer import DEFAULT_PORT, Peer, VoiceMessage
 from .relay import MODES, InspectionRelay
+
+
+# ---------------------------------------------------------------------------
+# Look and feel. macOS keeps its native (Aqua) look, which follows the system
+# light/dark setting. On Windows/Linux the default Tk look is plain white, so a
+# dark theme matching the Mac is applied instead.
+# Override with SECUREVOICE_THEME=dark or SECUREVOICE_THEME=native.
+# ---------------------------------------------------------------------------
+MONO = ("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10)
+GOOD, BAD, WARN, MUTED = "#4cc26a", "#ff6b6b", "#f0a030", "#9a9a9a"
+C = {"bg": "#1f1f1f", "panel": "#2a2a2a", "field": "#2f2f2f", "button": "#3a3a3a",
+     "hover": "#474747", "fg": "#e8e8e8", "muted": MUTED, "border": "#454545",
+     "accent": "#8e5bd6", "select": "#5b3a99"}
+
+
+def _use_dark_theme() -> bool:
+    choice = os.environ.get("SECUREVOICE_THEME", "").lower()
+    if choice in ("dark", "native"):
+        return choice == "dark"
+    return sys.platform != "darwin"
+
+
+def _dpi_aware() -> None:
+    """Sharp (non-blurry) text on scaled Windows displays. Must run before Tk()."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+
+def apply_theme(root) -> None:
+    if not _use_dark_theme():
+        return
+    base = ("Segoe UI", 10) if sys.platform == "win32" else ("TkDefaultFont", 10)
+    st = ttk.Style(root)
+    st.theme_use("clam")
+    root.configure(bg=C["bg"])
+    st.configure(".", background=C["bg"], foreground=C["fg"], fieldbackground=C["field"],
+                 bordercolor=C["border"], lightcolor=C["panel"], darkcolor=C["panel"],
+                 troughcolor=C["bg"], focuscolor=C["accent"], selectbackground=C["select"],
+                 selectforeground=C["fg"], insertcolor=C["fg"], arrowcolor=C["fg"], font=base)
+    st.configure("TLabelframe", background=C["bg"], bordercolor=C["border"], relief="solid")
+    st.configure("TLabelframe.Label", background=C["bg"], foreground=C["muted"])
+    st.configure("TButton", background=C["button"], padding=(12, 5), relief="flat")
+    st.map("TButton",
+           background=[("disabled", C["panel"]), ("pressed", C["select"]), ("active", C["hover"])],
+           foreground=[("disabled", "#6f6f6f")], bordercolor=[("focus", C["accent"])])
+    st.configure("TEntry", padding=5, insertcolor=C["fg"])
+    st.map("TEntry", fieldbackground=[("readonly", C["panel"]), ("disabled", C["panel"])],
+           foreground=[("disabled", "#777777")], bordercolor=[("focus", C["accent"])])
+    st.configure("TCombobox", background=C["button"], padding=4)
+    st.map("TCombobox", fieldbackground=[("readonly", C["field"])], foreground=[("readonly", C["fg"])],
+           selectbackground=[("readonly", C["field"])], selectforeground=[("readonly", C["fg"])],
+           background=[("active", C["hover"])])
+    st.configure("TRadiobutton", indicatorcolor=C["field"], indicatorbackground=C["field"])
+    st.map("TRadiobutton", indicatorcolor=[("selected", C["accent"])],
+           background=[("active", C["bg"])])
+    st.configure("Vertical.TScrollbar", background=C["button"], troughcolor=C["panel"],
+                 bordercolor=C["panel"], arrowcolor=C["fg"], relief="flat")
+    st.map("Vertical.TScrollbar", background=[("active", C["hover"])])
+    st.configure("Treeview", background=C["field"], fieldbackground=C["field"], rowheight=26)
+    st.configure("Treeview.Heading", background=C["button"], relief="flat", padding=4)
+    st.map("Treeview", background=[("selected", C["select"])])
+    st.map("Treeview.Heading", background=[("active", C["hover"])])
+    for opt, val in (("*Listbox.background", C["field"]), ("*Listbox.foreground", C["fg"]),
+                     ("*Listbox.selectBackground", C["select"]), ("*Listbox.selectForeground", C["fg"]),
+                     ("*Listbox.relief", "flat"), ("*Listbox.highlightThickness", 1),
+                     ("*Listbox.highlightBackground", C["border"]), ("*Listbox.highlightColor", C["accent"]),
+                     ("*Text.background", C["panel"]), ("*Text.foreground", C["fg"]),
+                     ("*Text.insertBackground", C["fg"]), ("*Text.relief", "flat"),
+                     ("*Text.highlightThickness", 1), ("*Text.highlightBackground", C["border"]),
+                     ("*Text.selectBackground", C["select"]), ("*Toplevel.background", C["bg"]),
+                     ("*TCombobox*Listbox.background", C["field"]),
+                     ("*TCombobox*Listbox.foreground", C["fg"]),
+                     ("*TCombobox*Listbox.selectBackground", C["select"]),
+                     ("*Scrollbar.background", C["button"]), ("*Scrollbar.troughColor", C["bg"])):
+        root.option_add(opt, val)
+
+
+class _ScrolledText(scrolledtext.ScrolledText):
+    """ScrolledText with a themed (ttk) scrollbar instead of the plain white one."""
+
+    def __init__(self, master=None, **kw):
+        super().__init__(master, **kw)
+        self.vbar.destroy()
+        self.vbar = ttk.Scrollbar(self.frame, orient="vertical", command=self.yview)
+        self.vbar.pack(side="right", fill="y", before=self._w)
+        self.configure(yscrollcommand=self.vbar.set)
+        if _use_dark_theme():
+            self.frame.configure(bg=C["bg"])
+
+
+def make_root() -> tk.Tk:
+    _dpi_aware()
+    root = tk.Tk()
+    apply_theme(root)
+    return root
 
 
 def local_ip() -> str:
@@ -46,7 +146,7 @@ class _QueuedApp:
         self.root.after(100, self._drain)
 
     def _make_log(self, parent):
-        log = scrolledtext.ScrolledText(parent, height=12, state="disabled", font=("Menlo", 11))
+        log = _ScrolledText(parent, height=12, state="disabled", font=MONO)
         return log
 
     def _append(self, widget, text):
@@ -100,7 +200,7 @@ class PeerApp(_QueuedApp):
         ttk.Label(conn, text=f"My IP: {local_ip()}").grid(row=4, column=0, columnspan=2, sticky="w")
         self.start_btn = ttk.Button(conn, text="Start", command=self.start)
         self.start_btn.grid(row=4, column=3, sticky="e")
-        self.status = ttk.Label(conn, text="Not connected", foreground="gray")
+        self.status = ttk.Label(conn, text="Not connected", foreground=MUTED)
         self.status.grid(row=4, column=2)
 
         voice = ttk.LabelFrame(f, text="Voice messages", padding=8)
@@ -145,7 +245,7 @@ class PeerApp(_QueuedApp):
             self.logmsg("WARNING: no pinned fingerprint – compare the peer fingerprint "
                         "shown below with the other laptop before trusting the session.")
         self.start_btn.configure(state="disabled")
-        self.status.configure(text="Connecting…", foreground="orange")
+        self.status.configure(text="Connecting…", foreground=WARN)
 
         def run():
             try:
@@ -160,13 +260,13 @@ class PeerApp(_QueuedApp):
         threading.Thread(target=run, daemon=True).start()
 
     def _on_connected(self):
-        self.status.configure(text=f"Secure ↔ {self.peer.channel.peer_name}", foreground="green")
+        self.status.configure(text=f"Secure ↔ {self.peer.channel.peer_name}", foreground=GOOD)
         self.rec_btn.configure(state="normal")
         self.file_btn.configure(state="normal")
 
     def _on_closed(self, err):
         self.status.configure(text="Disconnected" if not err else "Closed (error)",
-                              foreground="red" if err else "gray")
+                              foreground=BAD if err else MUTED)
         self.rec_btn.configure(state="disabled")
         self.file_btn.configure(state="disabled")
         self.start_btn.configure(state="normal")
@@ -356,8 +456,8 @@ class LabApp(_QueuedApp):
                                (230, 140, 120, 120, 70)):
             self.tree.heading(c, text=title)
             self.tree.column(c, width=w, anchor="w")
-        self.tree.tag_configure("broken", foreground="#d33")
-        self.tree.tag_configure("safe", foreground="#2a2")
+        self.tree.tag_configure("broken", foreground=BAD)
+        self.tree.tag_configure("safe", foreground=GOOD)
         self.tree.pack(fill="x", pady=8)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_detail())
 
@@ -367,7 +467,7 @@ class LabApp(_QueuedApp):
         ttk.Button(btns, text="▶ Play what the attacker recovered", command=self.play_result).pack(side="left", padx=6)
         ttk.Button(btns, text="■ Stop", command=audio.stop_playback).pack(side="left")
 
-        self.detail = scrolledtext.ScrolledText(f, height=8, wrap="word", font=("Menlo", 11), state="disabled")
+        self.detail = _ScrolledText(f, height=8, wrap="word", font=MONO, state="disabled")
         self.detail.pack(fill="both", expand=True, pady=(8, 0))
 
     @staticmethod
@@ -451,22 +551,22 @@ class LabApp(_QueuedApp):
 
 
 def open_lab(master=None):
-    LabApp(tk.Toplevel(master) if master else tk.Tk())
+    LabApp(tk.Toplevel(master) if master else make_root())
 
 
 def run_lab():
-    root = tk.Tk()
+    root = make_root()
     LabApp(root)
     root.mainloop()
 
 
 def run_peer(key_path: str):
-    root = tk.Tk()
+    root = make_root()
     PeerApp(root, key_path)
     root.mainloop()
 
 
 def run_relay():
-    root = tk.Tk()
+    root = make_root()
     RelayApp(root)
     root.mainloop()
