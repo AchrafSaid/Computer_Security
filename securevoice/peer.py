@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import protocol as P
-from .keys import Identity
 
 DEFAULT_PORT = 12347
 CHUNK = 32 * 1024
@@ -34,12 +33,12 @@ class VoiceMessage:
 
 
 class Peer:
-    def __init__(self, identity: Identity, name: str,
+    def __init__(self, passphrase: str, name: str,
                  on_voice: Callable[[VoiceMessage], None] = lambda m: None,
                  on_text: Callable[[str, str], None] = lambda s, t: None,
                  on_log: Callable[[str], None] = print,
                  on_closed: Callable[[Optional[Exception]], None] = lambda e: None):
-        self.identity = identity
+        self.passphrase = passphrase
         self.name = name
         self.on_voice, self.on_text, self.on_log, self.on_closed = on_voice, on_text, on_log, on_closed
         self.channel: Optional[P.SecureChannel] = None
@@ -50,7 +49,7 @@ class Peer:
 
     # ---------- connection setup ----------
     def listen_and_accept(self, port: int = DEFAULT_PORT, host: str = "0.0.0.0",
-                          expected_peer_fp: Optional[str] = None, timeout: Optional[float] = None,
+                          timeout: Optional[float] = None,
                           ready: Optional[threading.Event] = None) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -68,19 +67,18 @@ class Peer:
             self._listener = None
         conn.settimeout(None)
         self.on_log(f"Connection from {addr[0]}:{addr[1]}")
-        self._start(P.handshake_responder(conn, self.identity, self.name, expected_peer_fp))
+        self._start(P.handshake_responder(conn, self.passphrase, self.name))
 
-    def connect(self, host: str, port: int = DEFAULT_PORT,
-                expected_peer_fp: Optional[str] = None, timeout: float = 10.0) -> None:
+    def connect(self, host: str, port: int = DEFAULT_PORT, timeout: float = 10.0) -> None:
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(None)
         self.on_log(f"Connected to {host}:{port}")
-        self._start(P.handshake_initiator(sock, self.identity, self.name, expected_peer_fp))
+        self._start(P.handshake_initiator(sock, self.passphrase, self.name))
 
     def _start(self, channel: P.SecureChannel) -> None:
         self.channel = channel
         lk = channel.layer_keys
-        self.on_log(f"Secure session with '{channel.peer_name}' (fingerprint {channel.peer_fingerprint})")
+        self.on_log(f"Secure session with '{channel.peer_name}' (shared passphrase verified by both sides)")
         self.on_log(f"  L1 Affine a={lk.affine[0]} b={lk.affine[1]} | "
                     f"L2 Transposition {lk.transposition} | L3 AES-256-GCM")
         self._reader = threading.Thread(target=self._read_loop, daemon=True)

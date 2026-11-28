@@ -1,6 +1,6 @@
 """Entry point.
 
-    python run.py peer  [--key keys/peer.pem]     # source or destination laptop
+    python run.py peer                            # source or destination laptop
     python run.py relay                           # middle laptop (GUI)
     python run.py lab                             # offline cryptanalysis lab (GUI)
     python run.py relay --cli --listen 12347 --dest 192.168.1.20 --dest-port 12348 --mode tamper
@@ -13,8 +13,7 @@ from securevoice.peer import DEFAULT_PORT
 def main():
     ap = argparse.ArgumentParser(description="SecureVoice – three-layer encrypted voice messaging")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("peer")
-    p.add_argument("--key", default="keys/peer.pem", help="RSA identity key file (created if missing)")
+    sub.add_parser("peer")
     sub.add_parser("lab")
     r = sub.add_parser("relay")
     r.add_argument("--cli", action="store_true")
@@ -30,7 +29,7 @@ def main():
         run_lab()
     elif a.cmd == "peer":
         from securevoice.gui import run_peer
-        run_peer(a.key)
+        run_peer()
     elif a.cli:
         from securevoice.relay import InspectionRelay
         InspectionRelay(a.listen, a.dest, a.dest_port, a.mode, a.trigger).serve_once()

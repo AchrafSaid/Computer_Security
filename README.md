@@ -1,6 +1,6 @@
 # SecureVoice — CS401 Course Project
 
-Two-way encrypted voice messaging between laptops, using **three cryptographic layers in sequence**, an **RSA key exchange**, and an **inspection relay** on a third laptop that sits between them.
+Two-way encrypted voice messaging between laptops, using **three cryptographic layers in sequence**, keys from a **pre-shared passphrase**, and an **inspection relay** on a third laptop that sits between them.
 
 ## Cryptographic model
 
@@ -15,11 +15,11 @@ wire ─► L3⁻¹ AES-GCM (verify tag) ─► L2⁻¹ ─► L1⁻¹ ─► pl
 | L2 | Row transposition, 8 columns | column permutation | Classical permutation |
 | L3 | AES-256-GCM | 256-bit key, nonce = dir‖seq | Confidentiality + integrity |
 
-**Key management:** every laptop has an RSA-2048 identity (`keys/peer.pem`, created on first run).
-1. Both sides exchange `HELLO` messages containing their public key and a random nonce.
-2. The initiator generates a 32-byte session secret, wraps it with **RSA-OAEP** to the responder's key, and signs it with **RSA-PSS**. The signature covers both public keys and both nonces.
-3. Both sides derive all three layer keys from the secret with **HKDF-SHA256**.
-4. Each side can **pin** the other's fingerprint (compared by reading it aloud or showing the screen). A mismatch aborts the connection.
+**Key management: pre-shared passphrase** (no public-key cryptography).
+1. Before the demo, the two users agree on a passphrase in person, and both type it into **Shared passphrase**. It is never sent over the network.
+2. On connect, each side sends a fresh 16-byte random nonce in a `HELLO` message.
+3. Both sides compute `master = PBKDF2-HMAC-SHA256(passphrase, nonce_I‖nonce_R, 200,000 rounds)`. **HKDF-SHA256** then expands it into an authentication key and all three layer keys. New nonces mean new keys every session.
+4. **Mutual authentication:** each side sends `HMAC-SHA256(auth key, role‖transcript)`. The initiator only sends its proof after the responder's proof checks out. A wrong passphrase, or a man in the middle without it, means the connection is refused on both sides.
 
 **Integrity:**
 - Every frame is authenticated by GCM over the ciphertext plus its type, direction and sequence number.
@@ -45,7 +45,7 @@ All three laptops must be on the same network. Each GUI shows its own IP.
 | Middle (relay) | `.venv/bin/python run.py relay` | Listen `12347`, destination = Destination IP : `12348`, mode `observe` |
 | Source | `.venv/bin/python run.py peer` | Role **Connect**, IP = relay IP, port `12347` |
 
-1. Exchange fingerprints between source and destination and paste them into **Pinned peer fingerprint**.
+1. Type the same **Shared passphrase** on the source and the destination. Use 12+ characters, for example three random words. The relay doesn't need it.
 2. Start the destination, then the relay, then the source.
 3. Press **● Record**, speak for about 1 minute, then press **■ Stop & Send**. Do the same from the other side; both directions work at the same time.
 4. Received messages are saved in `received/` and can be played from the list.
@@ -64,15 +64,15 @@ A command-line relay is also available:
 ```bash
 .venv/bin/python -m pytest -v
 ```
-- `tests/test_unit.py`: each layer, the combined cipher, RSA wrap and sign, key derivation, and framing.
-- `tests/test_integration.py`: real localhost TCP connections. Covers two-way sending at the same time, a 60-second message, fingerprint mismatch, and the relay in observe, tamper, replay and drop modes.
+- `tests/test_unit.py`: each layer, the combined cipher, passphrase key derivation, HMAC proofs, the handshake (right and wrong passphrase), and framing.
+- `tests/test_integration.py`: real localhost TCP connections. Covers two-way sending at the same time, a 60-second message, a wrong passphrase being rejected, and the relay in observe, tamper, replay and drop modes.
 - `tests/test_analysis.py`: the cryptanalysis. Ciphertext-only, known-plaintext and chosen-plaintext attacks all break the classical layers, and all three fail once AES is added.
 
 ## Project layout
 
 ```
 securevoice/crypto_layers.py   three cipher layers + LayeredCipher
-securevoice/keys.py            RSA identity, OAEP, PSS, HKDF layer-key derivation
+securevoice/keys.py            passphrase key management: PBKDF2, HKDF, HMAC proofs
 securevoice/protocol.py        framing, handshake, SecureChannel (seq/replay checks)
 securevoice/peer.py            two-way voice peer (reader thread + thread-safe send)
 securevoice/relay.py           inspection relay for the middle laptop
@@ -83,7 +83,8 @@ run.py                         entry point
 ```
 
 ## Known limitations
-- Without a pinned fingerprint, the first connection trusts whatever key is presented (trust on first use). The GUI warns about this. Always pin fingerprints for the demo.
+- Security depends on the passphrase. An attacker who captures a handshake can try to guess it offline, which PBKDF2 with 200,000 rounds slows down, so use a long one. The GUI warns below 12 characters.
+- The passphrase must be shared in person beforehand. There is no forward secrecy: anyone who learns the passphrase later can decrypt recorded sessions.
 - The Affine and transposition layers are weak on their own. Security comes from AES-GCM, and the classical layers are there for the course's layered-model requirement and for the cryptanalysis discussion.
 
 ## Cryptanalysis (for the report)

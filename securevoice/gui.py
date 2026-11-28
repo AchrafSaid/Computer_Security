@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from . import analysis
 from . import audio
-from .keys import Identity
+from .keys import passphrase_warning
 from .peer import DEFAULT_PORT, Peer, VoiceMessage
 from .relay import MODES, InspectionRelay
 
@@ -71,6 +71,8 @@ def apply_theme(root) -> None:
     st.map("TCombobox", fieldbackground=[("readonly", C["field"])], foreground=[("readonly", C["fg"])],
            selectbackground=[("readonly", C["field"])], selectforeground=[("readonly", C["fg"])],
            background=[("active", C["hover"])])
+    st.configure("TCheckbutton", indicatorcolor=C["field"], indicatorbackground=C["field"])
+    st.map("TCheckbutton", indicatorcolor=[("selected", C["accent"])], background=[("active", C["bg"])])
     st.configure("TRadiobutton", indicatorcolor=C["field"], indicatorbackground=C["field"])
     st.map("TRadiobutton", indicatorcolor=[("selected", C["accent"])],
            background=[("active", C["bg"])])
@@ -157,10 +159,9 @@ class _QueuedApp:
 
 
 class PeerApp(_QueuedApp):
-    def __init__(self, root: tk.Tk, key_path: str):
+    def __init__(self, root: tk.Tk):
         super().__init__(root)
         root.title("SecureVoice – Peer")
-        self.identity = Identity.load_or_create(key_path)
         self.peer = None
         self.recorder = audio.Recorder()
         self.rec_start = None
@@ -179,7 +180,8 @@ class PeerApp(_QueuedApp):
         self.role = tk.StringVar(value="listen")
         self.host = tk.StringVar(value="127.0.0.1")
         self.port = tk.StringVar(value=str(DEFAULT_PORT))
-        self.pin = tk.StringVar()
+        self.passphrase = tk.StringVar()
+        self.show_pass = tk.BooleanVar(value=False)
         ttk.Label(conn, text="Name").grid(row=0, column=0, sticky="w")
         ttk.Entry(conn, textvariable=self.name, width=18).grid(row=0, column=1, sticky="w")
         ttk.Radiobutton(conn, text="Listen (destination)", variable=self.role,
@@ -190,13 +192,15 @@ class PeerApp(_QueuedApp):
         ttk.Entry(conn, textvariable=self.host, width=18).grid(row=1, column=1, sticky="w")
         ttk.Label(conn, text="Port").grid(row=1, column=2, sticky="e")
         ttk.Entry(conn, textvariable=self.port, width=8).grid(row=1, column=3, sticky="w")
-        ttk.Label(conn, text="Pinned peer fingerprint").grid(row=2, column=0, sticky="w")
-        ttk.Entry(conn, textvariable=self.pin, width=48).grid(row=2, column=1, columnspan=3, sticky="we")
-        ttk.Label(conn, text="My fingerprint").grid(row=3, column=0, sticky="w")
-        fp = ttk.Entry(conn, width=48)
-        fp.insert(0, self.identity.fingerprint())
-        fp.configure(state="readonly")
-        fp.grid(row=3, column=1, columnspan=3, sticky="we")
+        ttk.Label(conn, text="Shared passphrase").grid(row=2, column=0, sticky="w")
+        self.pass_entry = ttk.Entry(conn, textvariable=self.passphrase, width=40, show="•")
+        self.pass_entry.grid(row=2, column=1, columnspan=2, sticky="we")
+        ttk.Checkbutton(conn, text="Show", variable=self.show_pass,
+                        command=lambda: self.pass_entry.configure(show="" if self.show_pass.get() else "•")
+                        ).grid(row=2, column=3, sticky="w", padx=6)
+        ttk.Label(conn, text="Type the same passphrase on both laptops (agree on it in person – "
+                             "it is never sent over the network).",
+                  foreground=MUTED).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 4))
         ttk.Label(conn, text=f"My IP: {local_ip()}").grid(row=4, column=0, columnspan=2, sticky="w")
         self.start_btn = ttk.Button(conn, text="Start", command=self.start)
         self.start_btn.grid(row=4, column=3, sticky="e")
@@ -235,24 +239,30 @@ class PeerApp(_QueuedApp):
         except ValueError:
             messagebox.showerror("Port", "Port must be a number")
             return
-        self.peer = Peer(self.identity, self.name.get() or "peer",
+        passphrase = self.passphrase.get()
+        if not passphrase:
+            messagebox.showerror("Passphrase", "Enter the shared passphrase first "
+                                 "(the same one on both laptops).")
+            return
+        warning = passphrase_warning(passphrase)
+        if warning:
+            self.logmsg("WARNING: " + warning)
+        self.peer = Peer(passphrase, self.name.get() or "peer",
                          on_voice=lambda m: self.post(self._on_voice, m),
                          on_text=lambda s, t: self.logmsg(f"{s}: {t}"),
                          on_log=self.logmsg,
                          on_closed=lambda e: self.post(self._on_closed, e))
-        pin = self.pin.get().strip() or None
-        if not pin:
-            self.logmsg("WARNING: no pinned fingerprint – compare the peer fingerprint "
-                        "shown below with the other laptop before trusting the session.")
         self.start_btn.configure(state="disabled")
         self.status.configure(text="Connecting…", foreground=WARN)
 
+        role, host = self.role.get(), self.host.get().strip()   # read Tk values on the GUI thread
+
         def run():
             try:
-                if self.role.get() == "listen":
-                    self.peer.listen_and_accept(port, expected_peer_fp=pin)
+                if role == "listen":
+                    self.peer.listen_and_accept(port)
                 else:
-                    self.peer.connect(self.host.get().strip(), port, expected_peer_fp=pin)
+                    self.peer.connect(host, port)
                 self.post(self._on_connected)
             except Exception as e:
                 self.logmsg(f"Handshake failed: {e}")
@@ -560,9 +570,9 @@ def run_lab():
     root.mainloop()
 
 
-def run_peer(key_path: str):
+def run_peer():
     root = make_root()
-    PeerApp(root, key_path)
+    PeerApp(root)
     root.mainloop()
 
 

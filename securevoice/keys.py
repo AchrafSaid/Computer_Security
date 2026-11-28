@@ -1,87 +1,62 @@
-"""RSA identity keys, key wrapping (RSA-OAEP), signatures (RSA-PSS) and
-derivation of the three layer keys from one session secret (HKDF-SHA256)."""
+"""Key management with a pre-shared passphrase (no public-key cryptography).
+
+Both laptops type the same passphrase, agreed in person beforehand. For every
+session both sides pick a fresh random nonce and compute
+
+    master   = PBKDF2-HMAC-SHA256(passphrase, salt = nonce_I || nonce_R, 200,000 rounds)
+    auth key = HKDF-SHA256(master, "auth")
+    layer keys (Affine a,b | column order | AES-256 key) = HKDF-SHA256(master, transcript)
+
+so every session gets new keys although the passphrase stays the same. Each side
+proves it knows the passphrase with an HMAC-SHA256 over the handshake transcript;
+the passphrase itself is never sent.
+"""
 import hashlib
-import os
+import hmac
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .crypto_layers import LayeredCipher
 
-SESSION_SECRET_LEN = 32
 TRANSPOSITION_COLS = 8
-
-_OAEP = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-_PSS = padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH)
-
-
-class Identity:
-    """An RSA-2048 key pair, optionally persisted to a PEM file."""
-
-    def __init__(self, private_key: rsa.RSAPrivateKey):
-        self.private_key = private_key
-        self.public_key = private_key.public_key()
-
-    @classmethod
-    def generate(cls) -> "Identity":
-        return cls(rsa.generate_private_key(public_exponent=65537, key_size=2048))
-
-    @classmethod
-    def load_or_create(cls, path: str) -> "Identity":
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                return cls(serialization.load_pem_private_key(f.read(), password=None))
-        ident = cls.generate()
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(ident.private_key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption()))
-        os.chmod(path, 0o600)
-        return ident
-
-    def public_pem(self) -> bytes:
-        return public_pem(self.public_key)
-
-    def fingerprint(self) -> str:
-        return fingerprint(self.public_pem())
-
-    def sign(self, data: bytes) -> bytes:
-        return self.private_key.sign(data, _PSS, hashes.SHA256())
-
-    def unwrap(self, wrapped: bytes) -> bytes:
-        return self.private_key.decrypt(wrapped, _OAEP)
+NONCE_LEN = 16
+PBKDF2_ITERATIONS = 200_000          # slows down offline guessing of the passphrase
+MIN_PASSPHRASE_LEN = 12
 
 
-def public_pem(pub: rsa.RSAPublicKey) -> bytes:
-    return pub.public_bytes(serialization.Encoding.PEM,
-                            serialization.PublicFormat.SubjectPublicKeyInfo)
+def session_master(passphrase: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS) -> bytes:
+    if not passphrase:
+        raise ValueError("passphrase must not be empty")
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, iterations, dklen=32)
 
 
-def load_public(pem: bytes) -> rsa.RSAPublicKey:
-    key = serialization.load_pem_public_key(pem)
-    if not isinstance(key, rsa.RSAPublicKey) or key.key_size < 2048:
-        raise ValueError("peer key must be RSA >= 2048 bits")
-    return key
+def _hkdf(master: bytes, info: bytes, length: int) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=info).derive(master)
 
 
-def fingerprint(pem: bytes) -> str:
-    """Short human-comparable fingerprint (SHA-256, first 16 bytes, hex groups)."""
-    h = hashlib.sha256(pem).hexdigest()[:32].upper()
-    return ":".join(h[i:i + 4] for i in range(0, 32, 4))
+def auth_key(master: bytes) -> bytes:
+    return _hkdf(master, b"securevoice-v2|auth", 32)
 
 
-def wrap(pub: rsa.RSAPublicKey, secret: bytes) -> bytes:
-    return pub.encrypt(secret, _OAEP)
+def proof(key: bytes, role: bytes, transcript: bytes) -> bytes:
+    """HMAC-SHA256 that shows the sender knows the passphrase (role = b"I" or b"R")."""
+    return hmac.new(key, role + transcript, hashlib.sha256).digest()
 
 
-def verify(pub: rsa.RSAPublicKey, signature: bytes, data: bytes) -> None:
-    """Raises cryptography.exceptions.InvalidSignature on failure."""
-    pub.verify(signature, data, _PSS, hashes.SHA256())
+def check_proof(key: bytes, role: bytes, transcript: bytes, received: bytes) -> bool:
+    return hmac.compare_digest(proof(key, role, transcript), received)
+
+
+def passphrase_warning(passphrase: str) -> str:
+    """Empty string if the passphrase looks reasonable, otherwise a warning."""
+    if len(passphrase) < MIN_PASSPHRASE_LEN:
+        return (f"Passphrase is short ({len(passphrase)} characters). Someone who captures the "
+                f"handshake can try to guess it offline – use {MIN_PASSPHRASE_LEN}+ characters, "
+                "e.g. three random words.")
+    return ""
 
 
 @dataclass
@@ -93,8 +68,7 @@ class LayerKeys:
 
 def derive_layer_keys(secret: bytes, context: bytes) -> LayerKeys:
     """Expand one session secret into independent keys for all three layers."""
-    okm = HKDF(algorithm=hashes.SHA256(), length=32 + 2 + 32, salt=None,
-               info=b"securevoice-v1|" + context).derive(secret)
+    okm = _hkdf(secret, b"securevoice-v1|" + context, 32 + 2 + 32)
     aes_key = okm[:32]
     a = okm[32] | 1                      # odd => invertible mod 256
     b = okm[33]

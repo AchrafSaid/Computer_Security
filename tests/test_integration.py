@@ -8,7 +8,6 @@ import time
 
 import pytest
 
-from securevoice.keys import Identity
 from securevoice.peer import Peer
 from securevoice.relay import InspectionRelay
 
@@ -21,9 +20,12 @@ def tone(seconds: float, freq: float) -> bytes:
                     for i in range(n))
 
 
+PASS = "correct horse battery staple"
+
+
 @pytest.fixture(scope="module")
 def ids():
-    return Identity.generate(), Identity.generate()
+    return PASS, PASS                   # both laptops typed the same shared passphrase
 
 
 class Harness:
@@ -32,22 +34,22 @@ class Harness:
         self.got = threading.Event()
         self.ended = threading.Event()
 
-    def peer(self, ident, name):
+    def peer(self, passphrase, name):
         def on_voice(m):
             self.voices.append(m); self.got.set()
 
         def on_closed(e):
             self.closed.append(e); self.ended.set()
-        return Peer(ident, name, on_voice=on_voice, on_log=self.logs.append, on_closed=on_closed)
+        return Peer(passphrase, name, on_voice=on_voice, on_log=self.logs.append, on_closed=on_closed)
 
 
-def start_dest(dest, port=0, pin=None):
+def start_dest(dest, port=0):
     ready = threading.Event()
     errs = []
 
     def run():
         try:
-            dest.listen_and_accept(port, host="127.0.0.1", expected_peer_fp=pin, timeout=10, ready=ready)
+            dest.listen_and_accept(port, host="127.0.0.1", timeout=10, ready=ready)
         except Exception as e:
             errs.append(e)
     t = threading.Thread(target=run, daemon=True)
@@ -68,8 +70,8 @@ def wait_for(pred, timeout=15):
 def test_direct_full_duplex(ids):
     hs, hd = Harness(), Harness()
     src, dst = hs.peer(ids[0], "alice"), hd.peer(ids[1], "bob")
-    port, t, _ = start_dest(dst, pin=ids[0].fingerprint())
-    src.connect("127.0.0.1", port, expected_peer_fp=ids[1].fingerprint())
+    port, t, _ = start_dest(dst)
+    src.connect("127.0.0.1", port)
     t.join(5)
     a, b = tone(2.0, 440), tone(1.5, 660)
     # send both directions at the same time
@@ -93,13 +95,16 @@ def test_one_minute_message(ids):
     src.close(); dst.close()
 
 
-def test_pinned_fingerprint_mismatch_rejected(ids):
-    other = Identity.generate()
+def test_wrong_passphrase_rejected(ids):
+    """A peer (or a man in the middle) without the right passphrase cannot connect."""
     hs, hd = Harness(), Harness()
-    src, dst = hs.peer(ids[0], "alice"), hd.peer(ids[1], "bob")
+    src, dst = hs.peer("a guessed passphrase!", "mallory"), hd.peer(ids[1], "bob")
     port, t, errs = start_dest(dst)
-    with pytest.raises(Exception, match="fingerprint"):
-        src.connect("127.0.0.1", port, expected_peer_fp=other.fingerprint())
+    with pytest.raises(Exception, match="passphrase"):
+        src.connect("127.0.0.1", port)
+    t.join(5)
+    assert errs and "passphrase" in str(errs[0])
+    assert dst.channel is None
     src.close(); dst.close()
 
 

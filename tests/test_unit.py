@@ -3,7 +3,9 @@ import os
 import socket
 
 import pytest
-from cryptography.exceptions import InvalidSignature, InvalidTag
+import threading
+
+from cryptography.exceptions import InvalidTag
 
 from securevoice import keys as K
 from securevoice import protocol as P
@@ -88,22 +90,24 @@ def test_layered_ciphertext_looks_random():
     assert shannon_entropy(ct) > 7.9                       # max is 8 bits/byte
 
 
-# ---------- Keys ----------
-@pytest.fixture(scope="module")
-def ident():
-    return K.Identity.generate()
+# ---------- Keys (pre-shared passphrase) ----------
+def test_session_master_depends_on_passphrase_and_salt():
+    salt = os.urandom(32)
+    m = K.session_master("blue river 42 tiger", salt, iterations=1000)
+    assert m == K.session_master("blue river 42 tiger", salt, iterations=1000) and len(m) == 32
+    assert m != K.session_master("blue river 42 tigeR", salt, iterations=1000)   # one letter differs
+    assert m != K.session_master("blue river 42 tiger", os.urandom(32), iterations=1000)
+    with pytest.raises(ValueError):
+        K.session_master("", salt)
 
 
-def test_wrap_unwrap(ident):
-    s = os.urandom(32)
-    assert ident.unwrap(K.wrap(ident.public_key, s)) == s
-
-
-def test_sign_verify(ident):
-    sig = ident.sign(b"data")
-    K.verify(ident.public_key, sig, b"data")
-    with pytest.raises(InvalidSignature):
-        K.verify(ident.public_key, sig, b"datA")
+def test_proof_hmac():
+    key, t = os.urandom(32), os.urandom(32)
+    p = K.proof(key, b"I", t)
+    assert K.check_proof(key, b"I", t, p)
+    assert not K.check_proof(key, b"R", t, p)                 # roles are not interchangeable
+    assert not K.check_proof(os.urandom(32), b"I", t, p)      # wrong key
+    assert not K.check_proof(key, b"I", os.urandom(32), p)    # different session
 
 
 def test_derive_layer_keys_deterministic_and_valid():
@@ -115,14 +119,45 @@ def test_derive_layer_keys_deterministic_and_valid():
     assert K.derive_layer_keys(s, b"other").aes != a.aes
 
 
-def test_fingerprint_format(ident):
-    fp = ident.fingerprint()
-    assert len(fp.split(":")) == 8 and fp == K.fingerprint(ident.public_pem())
+def test_passphrase_warning():
+    assert K.passphrase_warning("short")
+    assert K.passphrase_warning("correct horse battery staple") == ""
 
 
-def test_identity_persisted(tmp_path):
-    p = str(tmp_path / "k.pem")
-    assert K.Identity.load_or_create(p).fingerprint() == K.Identity.load_or_create(p).fingerprint()
+def _handshake(pass_i, pass_r):
+    a, b = socket.socketpair()
+    out = {}
+
+    def resp():
+        try:
+            out["r"] = P.handshake_responder(b, pass_r, "bob")
+        except Exception as e:
+            out["r"] = e
+    t = threading.Thread(target=resp)
+    t.start()
+    try:
+        out["i"] = P.handshake_initiator(a, pass_i, "alice")
+    except Exception as e:
+        out["i"] = e
+        a.close()
+    t.join(10)
+    return out["i"], out["r"]
+
+
+def test_handshake_same_passphrase_gives_same_fresh_keys():
+    i, r = _handshake("correct horse battery staple", "correct horse battery staple")
+    assert i.layer_keys == r.layer_keys and i.peer_name == "bob" and r.peer_name == "alice"
+    i2, r2 = _handshake("correct horse battery staple", "correct horse battery staple")
+    assert i2.layer_keys.aes != i.layer_keys.aes                 # new nonces -> new session keys
+    i.send(b"hello"); assert r.recv() == b"hello"
+    for c in (i, r, i2, r2):
+        c.close()
+
+
+def test_handshake_wrong_passphrase_rejected_on_both_sides():
+    i, r = _handshake("correct horse battery staple", "wrong horse battery staple")
+    assert isinstance(i, P.SecurityError) and "passphrase" in str(i)
+    assert isinstance(r, P.SecurityError) and "passphrase" in str(r)
 
 
 # ---------- Framing ----------

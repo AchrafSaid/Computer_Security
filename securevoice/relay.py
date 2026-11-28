@@ -22,7 +22,7 @@ from typing import Callable, Optional
 from . import protocol as P
 
 MODES = ("observe", "tamper", "replay", "drop")
-TYPE_NAMES = {P.T_HELLO: "HELLO", P.T_KEYX: "KEYX", P.T_DATA: "DATA", P.T_BYE: "BYE"}
+TYPE_NAMES = {P.T_HELLO: "HELLO", P.T_AUTH: "AUTH", P.T_DATA: "DATA", P.T_BYE: "BYE"}
 BURST_GAP = 1.0   # seconds of silence on a direction that start a new intercepted message
 
 
