@@ -1,6 +1,11 @@
-"""Tkinter GUIs: the voice peer (source / destination laptops) and the
-inspection relay (middle laptop). All network callbacks are marshalled onto
-the Tk thread through a queue."""
+"""Tkinter GUIs: the voice peer (source / destination laptops), the inspection
+relay (middle laptop) and the offline cryptanalysis lab. All network callbacks
+are marshalled onto the Tk thread through a queue.
+
+Design: one dark theme on every platform, with an accent colour per role –
+teal for the peers (secure channel), amber for the man in the middle, violet
+for the cryptanalysis lab."""
+import hashlib
 import os
 import queue
 import socket
@@ -8,38 +13,39 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from . import analysis
 from . import audio
 from .keys import passphrase_warning
 from .peer import DEFAULT_PORT, Peer, VoiceMessage
-from .relay import MODES, InspectionRelay
-
+from .relay import MODES, InspectionRelay, shannon_entropy
 
 # ---------------------------------------------------------------------------
-# Look and feel. macOS keeps its native (Aqua) look, which follows the system
-# light/dark setting. On Windows/Linux the default Tk look is plain white, so a
-# dark theme matching the Mac is applied instead.
-# Override with SECUREVOICE_THEME=dark or SECUREVOICE_THEME=native.
+# Design tokens
 # ---------------------------------------------------------------------------
-MONO = ("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10)
-GOOD, BAD, WARN, MUTED = "#4cc26a", "#ff6b6b", "#f0a030", "#9a9a9a"
-C = {"bg": "#1f1f1f", "panel": "#2a2a2a", "field": "#2f2f2f", "button": "#3a3a3a",
-     "hover": "#474747", "fg": "#e8e8e8", "muted": MUTED, "border": "#454545",
-     "accent": "#8e5bd6", "select": "#5b3a99"}
+C = {"bg": "#101217", "card": "#181b22", "field": "#21252e", "button": "#272c37",
+     "hover": "#313744", "border": "#2b303b", "fg": "#e7e9ee", "muted": "#8a91a2",
+     "faint": "#5d6475", "ink": "#0b0d11"}
+GOOD, BAD, WARN, MUTED = "#34d399", "#f87171", "#fbbf24", C["muted"]
+ACCENTS = {"peer": "#2dd4bf", "relay": "#f5a524", "lab": "#a78bfa"}
+MAC = sys.platform == "darwin"
+WIN = sys.platform == "win32"
+MONO = ("Menlo", 12) if MAC else ("Consolas", 10)
+F = {}  # fonts, filled in by apply_theme()
 
 
-def _use_dark_theme() -> bool:
-    choice = os.environ.get("SECUREVOICE_THEME", "").lower()
-    if choice in ("dark", "native"):
-        return choice == "dark"
-    return sys.platform != "darwin"
+def _mix(c1: str, c2: str, t: float) -> str:
+    """Blend colour c1 towards c2 by t (0 = c1, 1 = c2)."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
 
 
 def _dpi_aware() -> None:
     """Sharp (non-blurry) text on scaled Windows displays. Must run before Tk()."""
-    if sys.platform == "win32":
+    if WIN:
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -48,67 +54,210 @@ def _dpi_aware() -> None:
 
 
 def apply_theme(root) -> None:
-    if not _use_dark_theme():
-        return
-    base = ("Segoe UI", 10) if sys.platform == "win32" else ("TkDefaultFont", 10)
+    fam = tkfont.nametofont("TkDefaultFont").actual("family")
+    base = 12 if MAC else 10
+    F.update(base=(fam, base), small=(fam, base - 2), bold=(fam, base, "bold"),
+             section=(fam, base - 3, "bold"), title=(fam, base + 5, "bold"),
+             value=(fam, base + 6, "bold"), mono=MONO, mono_small=(MONO[0], MONO[1] - 1),
+             timer=(MONO[0], base + 8))
     st = ttk.Style(root)
     st.theme_use("clam")
     root.configure(bg=C["bg"])
     st.configure(".", background=C["bg"], foreground=C["fg"], fieldbackground=C["field"],
-                 bordercolor=C["border"], lightcolor=C["panel"], darkcolor=C["panel"],
-                 troughcolor=C["bg"], focuscolor=C["accent"], selectbackground=C["select"],
-                 selectforeground=C["fg"], insertcolor=C["fg"], arrowcolor=C["fg"], font=base)
-    st.configure("TLabelframe", background=C["bg"], bordercolor=C["border"], relief="solid")
-    st.configure("TLabelframe.Label", background=C["bg"], foreground=C["muted"])
-    st.configure("TButton", background=C["button"], padding=(12, 5), relief="flat")
-    st.map("TButton",
-           background=[("disabled", C["panel"]), ("pressed", C["select"]), ("active", C["hover"])],
-           foreground=[("disabled", "#6f6f6f")], bordercolor=[("focus", C["accent"])])
-    st.configure("TEntry", padding=5, insertcolor=C["fg"])
-    st.map("TEntry", fieldbackground=[("readonly", C["panel"]), ("disabled", C["panel"])],
-           foreground=[("disabled", "#777777")], bordercolor=[("focus", C["accent"])])
-    st.configure("TCombobox", background=C["button"], padding=4)
+                 bordercolor=C["border"], lightcolor=C["field"], darkcolor=C["field"],
+                 troughcolor=C["field"], focuscolor=C["hover"], selectbackground=C["hover"],
+                 selectforeground=C["fg"], insertcolor=C["fg"], arrowcolor=C["muted"], font=F["base"])
+    # surfaces and text
+    st.configure("TFrame", background=C["bg"])
+    st.configure("Card.TFrame", background=C["card"])
+    st.configure("TLabel", background=C["bg"])
+    st.configure("Title.TLabel", font=F["title"])
+    st.configure("Sub.TLabel", foreground=C["muted"], font=F["small"])
+    st.configure("Card.TLabel", background=C["card"])
+    st.configure("Muted.Card.TLabel", background=C["card"], foreground=C["muted"], font=F["small"])
+    st.configure("Section.Card.TLabel", background=C["card"], foreground=C["faint"], font=F["section"])
+    st.configure("Value.Card.TLabel", background=C["card"], font=F["value"])
+    st.configure("Timer.Card.TLabel", background=C["card"], font=F["timer"])
+    # controls
+    flat = dict(bordercolor=C["border"], lightcolor=C["button"], darkcolor=C["button"], relief="flat")
+    st.configure("TButton", background=C["button"], padding=(14, 4), **flat)
+    st.map("TButton", background=[("disabled", C["field"]), ("pressed", C["hover"]), ("active", C["hover"])],
+           foreground=[("disabled", C["faint"])], lightcolor=[("active", C["hover"])],
+           darkcolor=[("active", C["hover"])])
+    st.configure("TEntry", padding=4, lightcolor=C["field"], darkcolor=C["field"])
+    st.map("TEntry", fieldbackground=[("disabled", C["card"])], foreground=[("disabled", C["faint"])],
+           bordercolor=[("disabled", C["border"])])
+    st.configure("TCombobox", background=C["button"], padding=5, lightcolor=C["field"], darkcolor=C["field"])
     st.map("TCombobox", fieldbackground=[("readonly", C["field"])], foreground=[("readonly", C["fg"])],
            selectbackground=[("readonly", C["field"])], selectforeground=[("readonly", C["fg"])],
            background=[("active", C["hover"])])
-    st.configure("TCheckbutton", indicatorcolor=C["field"], indicatorbackground=C["field"])
-    st.map("TCheckbutton", indicatorcolor=[("selected", C["accent"])], background=[("active", C["bg"])])
-    st.configure("TRadiobutton", indicatorcolor=C["field"], indicatorbackground=C["field"])
-    st.map("TRadiobutton", indicatorcolor=[("selected", C["accent"])],
-           background=[("active", C["bg"])])
-    st.configure("Vertical.TScrollbar", background=C["button"], troughcolor=C["panel"],
-                 bordercolor=C["panel"], arrowcolor=C["fg"], relief="flat")
+    st.configure("Vertical.TScrollbar", background=C["button"], troughcolor=C["field"],
+                 bordercolor=C["field"], lightcolor=C["button"], darkcolor=C["button"],
+                 arrowcolor=C["muted"], relief="flat", gripcount=0)
     st.map("Vertical.TScrollbar", background=[("active", C["hover"])])
-    st.configure("Treeview", background=C["field"], fieldbackground=C["field"], rowheight=26)
-    st.configure("Treeview.Heading", background=C["button"], relief="flat", padding=4)
-    st.map("Treeview", background=[("selected", C["select"])])
-    st.map("Treeview.Heading", background=[("active", C["hover"])])
+    rows = tkfont.Font(font=F["base"]).metrics("linespace")
+    st.configure("Treeview", background=C["field"], fieldbackground=C["field"], borderwidth=0,
+                 rowheight=int(rows * 1.55), lightcolor=C["field"], darkcolor=C["field"])
+    st.configure("Treeview.Heading", background=C["card"], foreground=C["muted"], relief="flat",
+                 padding=(8, 4), font=F["section"], lightcolor=C["card"], darkcolor=C["card"])
+    st.map("Treeview", background=[("selected", C["hover"])])
+    st.map("Treeview.Heading", background=[("active", C["card"])])
     for opt, val in (("*Listbox.background", C["field"]), ("*Listbox.foreground", C["fg"]),
-                     ("*Listbox.selectBackground", C["select"]), ("*Listbox.selectForeground", C["fg"]),
-                     ("*Listbox.relief", "flat"), ("*Listbox.highlightThickness", 1),
-                     ("*Listbox.highlightBackground", C["border"]), ("*Listbox.highlightColor", C["accent"]),
-                     ("*Text.background", C["panel"]), ("*Text.foreground", C["fg"]),
+                     ("*Listbox.selectBackground", C["hover"]), ("*Listbox.selectForeground", C["fg"]),
+                     ("*Listbox.relief", "flat"), ("*Listbox.borderWidth", 0),
+                     ("*Listbox.highlightThickness", 0), ("*Listbox.activeStyle", "none"),
+                     ("*Text.background", C["field"]), ("*Text.foreground", C["fg"]),
                      ("*Text.insertBackground", C["fg"]), ("*Text.relief", "flat"),
-                     ("*Text.highlightThickness", 1), ("*Text.highlightBackground", C["border"]),
-                     ("*Text.selectBackground", C["select"]), ("*Toplevel.background", C["bg"]),
+                     ("*Text.borderWidth", 0), ("*Text.highlightThickness", 0),
+                     ("*Text.selectBackground", C["hover"]), ("*Toplevel.background", C["bg"]),
                      ("*TCombobox*Listbox.background", C["field"]),
                      ("*TCombobox*Listbox.foreground", C["fg"]),
-                     ("*TCombobox*Listbox.selectBackground", C["select"]),
-                     ("*Scrollbar.background", C["button"]), ("*Scrollbar.troughColor", C["bg"])):
+                     ("*TCombobox*Listbox.selectBackground", C["hover"])):
         root.option_add(opt, val)
+
+
+def _accent_styles(root, key: str) -> str:
+    """Per-window accent variants of the buttons, toggles and inputs."""
+    acc = ACCENTS[key]
+    st = ttk.Style(root)
+    k = key.capitalize()
+    for name, colour in ((f"{k}.Accent.TButton", acc), (f"{k}.Danger.TButton", BAD)):
+        st.configure(name, background=colour, foreground=C["ink"], font=F["bold"], padding=(18, 5),
+                     bordercolor=colour, lightcolor=colour, darkcolor=colour)
+        hi = _mix(colour, "#ffffff", 0.18)
+        st.map(name, background=[("disabled", C["field"]), ("pressed", _mix(colour, "#000000", 0.15)),
+                                 ("active", hi)],
+               foreground=[("disabled", C["faint"])],
+               bordercolor=[("disabled", C["border"]), ("active", hi)],
+               lightcolor=[("disabled", C["field"]), ("active", hi)],
+               darkcolor=[("disabled", C["field"]), ("active", hi)])
+    sel = _mix(acc, C["card"], 0.78)
+    st.configure(f"{k}.Seg.Toolbutton", background=C["field"], foreground=C["muted"], padding=(14, 4),
+                 anchor="center", bordercolor=C["border"], lightcolor=C["field"], darkcolor=C["field"])
+    st.map(f"{k}.Seg.Toolbutton", background=[("selected", sel), ("active", C["hover"])],
+           foreground=[("selected", acc)], bordercolor=[("selected", _mix(acc, C["card"], 0.4))],
+           lightcolor=[("selected", sel)], darkcolor=[("selected", sel)])
+    st.configure(f"{k}.TEntry")
+    st.map(f"{k}.TEntry", bordercolor=[("focus", acc), ("disabled", C["border"])],
+           fieldbackground=[("disabled", C["card"])], foreground=[("disabled", C["faint"])])
+    st.configure(f"{k}.TCheckbutton", background=C["card"], foreground=C["muted"], font=F["small"],
+                 indicatorcolor=C["field"], indicatorbackground=C["field"])
+    st.map(f"{k}.TCheckbutton", indicatorcolor=[("selected", acc)], background=[("active", C["card"])])
+    return k
 
 
 class _ScrolledText(scrolledtext.ScrolledText):
     """ScrolledText with a themed (ttk) scrollbar instead of the plain white one."""
 
     def __init__(self, master=None, **kw):
+        kw.setdefault("padx", 10)
+        kw.setdefault("pady", 8)
         super().__init__(master, **kw)
         self.vbar.destroy()
         self.vbar = ttk.Scrollbar(self.frame, orient="vertical", command=self.yview)
         self.vbar.pack(side="right", fill="y", before=self._w)
         self.configure(yscrollcommand=self.vbar.set)
-        if _use_dark_theme():
-            self.frame.configure(bg=C["bg"])
+        self.frame.configure(bg=C["field"])
+
+
+# ---------------------------------------------------------------------------
+# Small custom widgets
+# ---------------------------------------------------------------------------
+def _round_rect(cv, x1, y1, x2, y2, r, **kw):
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+class Pill(tk.Canvas):
+    """Rounded status badge: coloured dot + text."""
+
+    def __init__(self, master, bg=C["bg"]):
+        self.font = tkfont.Font(font=F["small"])
+        self.font.configure(weight="bold")
+        h = self.font.metrics("linespace") + 12
+        super().__init__(master, height=h, width=40, bg=bg, highlightthickness=0, bd=0)
+        self.h = h
+
+    def set(self, text: str, colour: str) -> None:
+        self.delete("all")
+        h, w = self.h, self.font.measure(text) + self.h + 18
+        self.configure(width=w)
+        bg = self["bg"]
+        _round_rect(self, 1, 1, w - 1, h - 1, h // 2, fill=_mix(colour, bg, 0.86),
+                    outline=_mix(colour, bg, 0.55))
+        d = h // 2
+        self.create_oval(d - 4, d - 4, d + 4, d + 4, fill=colour, outline="")
+        self.create_text(d + 10, d, text=text, anchor="w", fill=colour, font=self.font)
+
+
+class LevelMeter(tk.Canvas):
+    def __init__(self, master, accent, width=150, height=8):
+        super().__init__(master, width=width, height=height, bg=C["card"], highlightthickness=0, bd=0)
+        self.w, self.h, self.accent = width, height, accent
+        self.set(0)
+
+    def set(self, level: float) -> None:
+        self.delete("all")
+        _round_rect(self, 0, 0, self.w, self.h, self.h // 2, fill=C["field"], outline="")
+        x = max(0.0, min(1.0, level)) * self.w
+        if x > self.h:
+            colour = self.accent if level < 0.65 else (WARN if level < 0.9 else BAD)
+            _round_rect(self, 0, 0, x, self.h, self.h // 2, fill=colour, outline="")
+
+
+def _logo(master, accent):
+    cv = tk.Canvas(master, width=38, height=38, bg=C["bg"], highlightthickness=0, bd=0)
+    _round_rect(cv, 1, 1, 37, 37, 11, fill=accent, outline="")
+    for x, hgt in ((10, 8), (15, 16), (20, 22), (25, 14), (30, 6)):
+        cv.create_line(x, 19 - hgt / 2, x, 19 + hgt / 2, fill=C["ink"], width=3, capstyle="round")
+    return cv
+
+
+def _header(master, accent, subtitle):
+    h = ttk.Frame(master, padding=(16, 12, 16, 8))
+    h.pack(fill="x")
+    _logo(h, accent).pack(side="left")
+    t = ttk.Frame(h, padding=(12, 0, 0, 0))
+    t.pack(side="left")
+    ttk.Label(t, text="SecureVoice", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(t, text=subtitle, style="Sub.TLabel").pack(anchor="w")
+    pill = Pill(h)
+    pill.pack(side="right")
+    return pill
+
+
+def _card(master, title, fill="x", expand=False, pady=(0, 10), padding=(14, 10, 14, 12), padx=16):
+    outer = tk.Frame(master, bg=C["card"], highlightthickness=1, highlightbackground=C["border"],
+                     highlightcolor=C["border"], bd=0)
+    outer.pack(fill=fill, expand=expand, padx=padx, pady=pady)
+    inner = ttk.Frame(outer, style="Card.TFrame", padding=padding)
+    inner.pack(fill="both", expand=True)
+    if title:
+        ttk.Label(inner, text=title.upper(), style="Section.Card.TLabel").pack(anchor="w", pady=(0, 6))
+    return inner
+
+
+def _tile(master, title, accent):
+    f = tk.Frame(master, bg=C["card"], highlightthickness=1, highlightbackground=C["border"], bd=0)
+    inner = ttk.Frame(f, style="Card.TFrame", padding=(14, 8))
+    inner.pack(fill="both", expand=True)
+    ttk.Label(inner, text=title.upper(), style="Section.Card.TLabel").pack(anchor="w")
+    val = ttk.Label(inner, text="–", style="Value.Card.TLabel")
+    val.pack(anchor="w", pady=(2, 0))
+    note = ttk.Label(inner, text="", style="Muted.Card.TLabel")
+    note.pack(anchor="w")
+    return f, val, note
+
+
+def _listbox(master, height):
+    wrap = tk.Frame(master, bg=C["field"])
+    lb = tk.Listbox(wrap, height=height, font=F["mono_small"])
+    lb.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=6)
+    sb = ttk.Scrollbar(wrap, orient="vertical", command=lb.yview)
+    sb.pack(side="right", fill="y")
+    lb.configure(yscrollcommand=sb.set)
+    return wrap, lb
 
 
 def make_root() -> tk.Tk:
@@ -130,9 +279,13 @@ def local_ip() -> str:
 
 
 class _QueuedApp:
+    ALERT = ("SECURITY ALERT", "failed", "error", "Error", "refused", "rejected")
+    OK = ("Secure session", "verified", "Sent voice", "Received voice", "listening on", "Listening on")
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.q: "queue.Queue" = queue.Queue()
+        root.configure(bg=C["bg"])
         root.after(100, self._drain)
 
     def post(self, fn, *args):
@@ -147,21 +300,44 @@ class _QueuedApp:
             pass
         self.root.after(100, self._drain)
 
-    def _make_log(self, parent):
-        log = _ScrolledText(parent, height=12, state="disabled", font=MONO)
+    def _make_log(self, parent, height=8):
+        log = _ScrolledText(parent, height=height, state="disabled", font=F["mono_small"], wrap="word")
+        log.tag_configure("ts", foreground=C["faint"])
+        log.tag_configure("alert", foreground=BAD)
+        log.tag_configure("ok", foreground=GOOD)
+        log.tag_configure("warn", foreground=WARN)
+        log.tag_configure("dim", foreground=C["muted"])
         return log
 
     def _append(self, widget, text):
+        if any(k in text for k in self.ALERT):
+            tag = "alert"
+        elif "WARNING" in text or "TEST:" in text:
+            tag = "warn"
+        elif any(k in text for k in self.OK):
+            tag = "ok"
+        elif text.startswith("  ") or "DATA seq=" in text:
+            tag = "dim"
+        else:
+            tag = ""
         widget.configure(state="normal")
-        widget.insert("end", time.strftime("[%H:%M:%S] ") + text + "\n")
+        widget.insert("end", time.strftime("%H:%M:%S  "), ("ts",))
+        widget.insert("end", text + "\n", (tag,) if tag else ())
         widget.see("end")
         widget.configure(state="disabled")
 
 
+# ---------------------------------------------------------------------------
+# Peer (source / destination)
+# ---------------------------------------------------------------------------
 class PeerApp(_QueuedApp):
+    PORTS = {"listen": str(DEFAULT_PORT + 1), "connect": str(DEFAULT_PORT)}
+
     def __init__(self, root: tk.Tk):
         super().__init__(root)
         root.title("SecureVoice – Peer")
+        self.k = _accent_styles(root, "peer")
+        self.accent = ACCENTS["peer"]
         self.peer = None
         self.recorder = audio.Recorder()
         self.rec_start = None
@@ -171,63 +347,121 @@ class PeerApp(_QueuedApp):
 
     # ---------- layout ----------
     def _build(self):
-        f = ttk.Frame(self.root, padding=10)
-        f.pack(fill="both", expand=True)
+        k = self.k
+        self.pill = _header(self.root, self.accent, "Peer · encrypted voice messages")
+        self.pill.set("Not connected", MUTED)
 
-        conn = ttk.LabelFrame(f, text="Connection", padding=8)
-        conn.pack(fill="x")
+        conn = _card(self.root, "Connection")
+        g = ttk.Frame(conn, style="Card.TFrame")
+        g.pack(fill="x")
+        g.columnconfigure(1, weight=1)
         self.name = tk.StringVar(value=socket.gethostname().split(".")[0])
         self.role = tk.StringVar(value="listen")
         self.host = tk.StringVar(value="127.0.0.1")
-        self.port = tk.StringVar(value=str(DEFAULT_PORT))
+        self.port = tk.StringVar(value=self.PORTS["listen"])
         self.passphrase = tk.StringVar()
         self.show_pass = tk.BooleanVar(value=False)
-        ttk.Label(conn, text="Name").grid(row=0, column=0, sticky="w")
-        ttk.Entry(conn, textvariable=self.name, width=18).grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(conn, text="Listen (destination)", variable=self.role,
-                        value="listen").grid(row=0, column=2, padx=8)
-        ttk.Radiobutton(conn, text="Connect (source)", variable=self.role,
-                        value="connect").grid(row=0, column=3)
-        ttk.Label(conn, text="Peer / relay IP").grid(row=1, column=0, sticky="w")
-        ttk.Entry(conn, textvariable=self.host, width=18).grid(row=1, column=1, sticky="w")
-        ttk.Label(conn, text="Port").grid(row=1, column=2, sticky="e")
-        ttk.Entry(conn, textvariable=self.port, width=8).grid(row=1, column=3, sticky="w")
-        ttk.Label(conn, text="Shared passphrase").grid(row=2, column=0, sticky="w")
-        self.pass_entry = ttk.Entry(conn, textvariable=self.passphrase, width=40, show="•")
-        self.pass_entry.grid(row=2, column=1, columnspan=2, sticky="we")
-        ttk.Checkbutton(conn, text="Show", variable=self.show_pass,
+
+        def label(text, r, c=0):
+            ttk.Label(g, text=text, style="Muted.Card.TLabel").grid(row=r, column=c, sticky="w", padx=(0, 12), pady=3)
+
+        label("Role", 0)
+        seg = ttk.Frame(g, style="Card.TFrame")
+        seg.grid(row=0, column=1, columnspan=3, sticky="w", pady=3)
+        for text, value in (("Listen · destination", "listen"), ("Connect · source", "connect")):
+            ttk.Radiobutton(seg, text=text, value=value, variable=self.role, style=f"{k}.Seg.Toolbutton",
+                            command=self._role_changed).pack(side="left")
+        label("Name", 1)
+        ttk.Entry(g, textvariable=self.name, style=f"{k}.TEntry", width=22).grid(row=1, column=1, sticky="w")
+        label("Port", 1, 2)
+        ttk.Entry(g, textvariable=self.port, style=f"{k}.TEntry", width=8).grid(row=1, column=3, sticky="w")
+        label("Peer / relay IP", 2)
+        self.host_entry = ttk.Entry(g, textvariable=self.host, style=f"{k}.TEntry", width=22)
+        self.host_entry.grid(row=2, column=1, sticky="w")
+        self.host_hint = ttk.Label(g, text="", style="Muted.Card.TLabel")
+        self.host_hint.grid(row=2, column=2, columnspan=2, sticky="w")
+        label("Shared passphrase", 3)
+        self.pass_entry = ttk.Entry(g, textvariable=self.passphrase, style=f"{k}.TEntry", show="•")
+        self.pass_entry.grid(row=3, column=1, columnspan=2, sticky="we")
+        ttk.Checkbutton(g, text="Show", variable=self.show_pass, style=f"{k}.TCheckbutton",
                         command=lambda: self.pass_entry.configure(show="" if self.show_pass.get() else "•")
-                        ).grid(row=2, column=3, sticky="w", padx=6)
-        ttk.Label(conn, text="Type the same passphrase on both laptops (agree on it in person – "
-                             "it is never sent over the network).",
-                  foreground=MUTED).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 4))
-        ttk.Label(conn, text=f"My IP: {local_ip()}").grid(row=4, column=0, columnspan=2, sticky="w")
-        self.start_btn = ttk.Button(conn, text="Start", command=self.start)
-        self.start_btn.grid(row=4, column=3, sticky="e")
-        self.status = ttk.Label(conn, text="Not connected", foreground=MUTED)
-        self.status.grid(row=4, column=2)
+                        ).grid(row=3, column=3, sticky="w", padx=(10, 0))
+        foot = ttk.Frame(conn, style="Card.TFrame")
+        foot.pack(fill="x", pady=(8, 0))
+        ttk.Label(foot, text=f"This laptop  {local_ip()}   ·   same passphrase on both laptops, "
+                             "never sent over the network", style="Muted.Card.TLabel").pack(side="left")
+        self.start_btn = ttk.Button(foot, text="Start", style=f"{k}.Accent.TButton", command=self.start)
+        self.start_btn.pack(side="right")
+        self._role_changed()
 
-        voice = ttk.LabelFrame(f, text="Voice messages", padding=8)
-        voice.pack(fill="x", pady=8)
-        self.rec_btn = ttk.Button(voice, text="● Record", command=self.toggle_record, state="disabled")
+        pipe = _card(self.root, "Encryption pipeline")
+        row = ttk.Frame(pipe, style="Card.TFrame")
+        row.pack(fill="x")
+        self.chips = []
+        for i, title in enumerate(("Affine", "Row transposition", "AES-256-GCM")):
+            if i:
+                tk.Label(row, text="→", bg=C["card"], fg=C["faint"], font=F["bold"]).pack(side="left", padx=6)
+            chip = tk.Frame(row, bg=C["field"], highlightthickness=1, highlightbackground=C["border"], bd=0)
+            chip.pack(side="left", fill="x", expand=True)
+            t = tk.Label(chip, text=f"{i + 1}  {title}", bg=C["field"], fg=C["muted"], font=F["bold"], anchor="w")
+            t.pack(fill="x", padx=10, pady=(5, 0))
+            v = tk.Label(chip, text="waiting for session", bg=C["field"], fg=C["faint"], font=F["mono_small"], anchor="w")
+            v.pack(fill="x", padx=10, pady=(0, 5))
+            self.chips.append((chip, t, v))
+
+        voice = _card(self.root, "Voice message")
+        vr = ttk.Frame(voice, style="Card.TFrame")
+        vr.pack(fill="x")
+        self.rec_btn = ttk.Button(vr, text="●  Record", style=f"{k}.Accent.TButton", width=14,
+                                  command=self.toggle_record, state="disabled")
         self.rec_btn.pack(side="left")
-        self.timer = ttk.Label(voice, text="00:00")
-        self.timer.pack(side="left", padx=8)
-        self.file_btn = ttk.Button(voice, text="Send WAV file…", command=self.send_file, state="disabled")
-        self.file_btn.pack(side="left", padx=8)
+        self.timer = ttk.Label(vr, text="00:00", style="Timer.Card.TLabel")
+        self.timer.pack(side="left", padx=(16, 12))
+        self.meter = LevelMeter(vr, self.accent)
+        self.meter.pack(side="left")
+        self.file_btn = ttk.Button(vr, text="Send WAV file…", command=self.send_file, state="disabled")
+        self.file_btn.pack(side="right")
 
-        inbox = ttk.LabelFrame(f, text="Received", padding=8)
-        inbox.pack(fill="both", expand=True)
-        self.inbox = tk.Listbox(inbox, height=6)
-        self.inbox.pack(side="left", fill="both", expand=True)
-        btns = ttk.Frame(inbox)
-        btns.pack(side="left", padx=6)
-        ttk.Button(btns, text="▶ Play", command=self.play_selected).pack(fill="x")
-        ttk.Button(btns, text="■ Stop", command=audio.stop_playback).pack(fill="x", pady=4)
+        inbox = _card(self.root, "Received")
+        ir = ttk.Frame(inbox, style="Card.TFrame")
+        ir.pack(fill="both", expand=True)
+        wrap, self.inbox = _listbox(ir, 3)
+        wrap.pack(side="left", fill="both", expand=True)
+        self.inbox.bind("<Double-Button-1>", lambda e: self.play_selected())
+        btns = ttk.Frame(ir, style="Card.TFrame")
+        btns.pack(side="left", padx=(10, 0), anchor="n")
+        ttk.Button(btns, text="▶  Play", command=self.play_selected).pack(fill="x")
+        ttk.Button(btns, text="■  Stop", command=audio.stop_playback).pack(fill="x", pady=(6, 0))
 
-        self.log = self._make_log(f)
-        self.log.pack(fill="both", expand=True, pady=(8, 0))
+        act = _card(self.root, "Activity", fill="both", expand=True, pady=(0, 16))
+        self.log = self._make_log(act, height=5)
+        self.log.pack(fill="both", expand=True)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
+
+    def _role_changed(self):
+        role = self.role.get()
+        other = "connect" if role == "listen" else "listen"
+        if self.port.get() == self.PORTS[other]:          # follow the demo's default ports
+            self.port.set(self.PORTS[role])
+        if role == "listen":
+            self.host_entry.configure(state="disabled")
+            self.host_hint.configure(text="not needed – waits for a connection")
+        else:
+            self.host_entry.configure(state="normal")
+            self.host_hint.configure(text="IP of the relay (or of the other peer)")
+
+    def _set_chips(self, lk):
+        if lk is None:
+            values = ["waiting for session"] * 3
+        else:
+            values = [f"a={lk.affine[0]}  b={lk.affine[1]}",
+                      " ".join(map(str, lk.transposition)),
+                      f"256-bit key · id {hashlib.sha256(lk.aes).hexdigest()[:8].upper()}"]
+        for (chip, t, v), text in zip(self.chips, values):
+            on = lk is not None
+            chip.configure(highlightbackground=_mix(self.accent, C["card"], 0.35) if on else C["border"])
+            t.configure(fg=self.accent if on else C["muted"])
+            v.configure(text=text, fg=C["fg"] if on else C["faint"])
 
     def logmsg(self, text):
         self.post(self._append, self.log, text)
@@ -253,9 +487,8 @@ class PeerApp(_QueuedApp):
                          on_log=self.logmsg,
                          on_closed=lambda e: self.post(self._on_closed, e))
         self.start_btn.configure(state="disabled")
-        self.status.configure(text="Connecting…", foreground=WARN)
-
         role, host = self.role.get(), self.host.get().strip()   # read Tk values on the GUI thread
+        self.pill.set("Waiting for peer…" if role == "listen" else "Connecting…", WARN)
 
         def run():
             try:
@@ -270,13 +503,18 @@ class PeerApp(_QueuedApp):
         threading.Thread(target=run, daemon=True).start()
 
     def _on_connected(self):
-        self.status.configure(text=f"Secure ↔ {self.peer.channel.peer_name}", foreground=GOOD)
+        self.pill.set(f"Secure · {self.peer.channel.peer_name}", GOOD)
+        self._set_chips(self.peer.channel.layer_keys)
         self.rec_btn.configure(state="normal")
         self.file_btn.configure(state="normal")
 
     def _on_closed(self, err):
-        self.status.configure(text="Disconnected" if not err else "Closed (error)",
-                              foreground=BAD if err else MUTED)
+        self.pill.set("Connection failed" if err else "Disconnected", BAD if err else MUTED)
+        self._set_chips(None)
+        if self.rec_start is not None:
+            self.recorder.stop()
+            self.rec_start = None
+            self.rec_btn.configure(text="●  Record", style=f"{self.k}.Accent.TButton")
         self.rec_btn.configure(state="disabled")
         self.file_btn.configure(state="disabled")
         self.start_btn.configure(state="normal")
@@ -290,19 +528,23 @@ class PeerApp(_QueuedApp):
                 messagebox.showerror("Microphone", str(e))
                 return
             self.rec_start = time.time()
-            self.rec_btn.configure(text="■ Stop & Send")
+            self.rec_btn.configure(text="■  Stop & Send", style=f"{self.k}.Danger.TButton")
+            self.timer.configure(foreground=BAD)
             self._tick()
         else:
             pcm = self.recorder.stop()
             self.rec_start = None
-            self.rec_btn.configure(text="● Record")
+            self.rec_btn.configure(text="●  Record", style=f"{self.k}.Accent.TButton")
+            self.timer.configure(foreground=C["fg"])
+            self.meter.set(0)
             self._send(pcm, audio.SAMPLE_RATE, audio.CHANNELS, audio.SAMPLE_WIDTH)
 
     def _tick(self):
         if self.rec_start is not None:
             s = int(time.time() - self.rec_start)
             self.timer.configure(text=f"{s // 60:02d}:{s % 60:02d}")
-            self.root.after(250, self._tick)
+            self.meter.set(self.recorder.level)
+            self.root.after(80, self._tick)
 
     def send_file(self):
         path = filedialog.askopenfilename(filetypes=[("WAV audio", "*.wav")])
@@ -328,7 +570,9 @@ class PeerApp(_QueuedApp):
         path = os.path.join("received", time.strftime(f"msg{m.msg_id}_%H%M%S.wav"))
         audio.save_wav(path, m.pcm, m.sample_rate, m.channels, m.sample_width)
         self.received.append(m)
-        self.inbox.insert("end", f"#{m.msg_id} from {m.sender} – {m.duration:.1f}s – {path}")
+        self.inbox.insert("end", f"  #{m.msg_id:<3} {time.strftime('%H:%M:%S')}   {m.duration:5.1f} s   "
+                                 f"from {m.sender}   ✓ verified")
+        self.inbox.see("end")
 
     def play_selected(self):
         sel = self.inbox.curselection()
@@ -342,53 +586,118 @@ class PeerApp(_QueuedApp):
         self.root.destroy()
 
 
+# ---------------------------------------------------------------------------
+# Relay (man in the middle)
+# ---------------------------------------------------------------------------
+MODE_INFO = {
+    "observe": "Passive · forwards everything unchanged, records and measures the ciphertext.",
+    "tamper": "Active · flips one bit inside DATA frame #{n}. The receiver must reject it (integrity check).",
+    "replay": "Active · re-sends an earlier DATA frame at frame #{n}. The receiver must reject it (sequence check).",
+    "drop": "Active · silently deletes DATA frame #{n}. The receiver must reject the message (missing frame).",
+}
+
+
 class RelayApp(_QueuedApp):
     def __init__(self, root: tk.Tk):
         super().__init__(root)
-        root.title("SecureVoice – Inspection Relay (middle laptop)")
-        f = ttk.Frame(root, padding=10)
-        f.pack(fill="both", expand=True)
-        cfg = ttk.LabelFrame(f, text="Relay settings", padding=8)
-        cfg.pack(fill="x")
+        root.title("SecureVoice – Man in the middle")
+        k = self.k = _accent_styles(root, "relay")
+        self.accent = ACCENTS["relay"]
+        self.relay = None
+        self._entropy_cache = (0, 0.0)
+        self.pill = _header(root, self.accent, "Man in the middle · inspection relay")
+        self.pill.set("Idle", MUTED)
+
+        cfg = _card(root, "Relay settings")
+        g = ttk.Frame(cfg, style="Card.TFrame")
+        g.pack(fill="x")
         self.lport = tk.StringVar(value=str(DEFAULT_PORT))
         self.dhost = tk.StringVar(value="127.0.0.1")
         self.dport = tk.StringVar(value=str(DEFAULT_PORT + 1))
         self.mode = tk.StringVar(value="observe")
         self.trigger = tk.StringVar(value="5")
-        rows = [("Listen port", self.lport), ("Destination IP", self.dhost),
-                ("Destination port", self.dport), ("Trigger DATA frame #", self.trigger)]
-        for i, (lbl, var) in enumerate(rows):
-            ttk.Label(cfg, text=lbl).grid(row=i, column=0, sticky="w")
-            ttk.Entry(cfg, textvariable=var, width=18).grid(row=i, column=1, sticky="w")
-        ttk.Label(cfg, text="Mode").grid(row=4, column=0, sticky="w")
-        ttk.Combobox(cfg, textvariable=self.mode, values=MODES, state="readonly",
-                     width=16).grid(row=4, column=1, sticky="w")
-        ttk.Label(cfg, text=f"My IP: {local_ip()}").grid(row=5, column=0, sticky="w")
-        self.btn = ttk.Button(cfg, text="Start relay", command=self.start)
-        self.btn.grid(row=5, column=1, sticky="e")
+        fields = [("Listen port", self.lport, 0, 0, 8), ("Destination IP", self.dhost, 0, 2, 18),
+                  ("Destination port", self.dport, 1, 2, 8), ("Trigger DATA frame #", self.trigger, 1, 0, 8)]
+        for text, var, r, c, w in fields:
+            ttk.Label(g, text=text, style="Muted.Card.TLabel").grid(row=r, column=c, sticky="w", padx=(0, 12), pady=3)
+            ttk.Entry(g, textvariable=var, style=f"{k}.TEntry", width=w).grid(row=r, column=c + 1, sticky="w", padx=(0, 24))
+        ttk.Label(g, text="Mode", style="Muted.Card.TLabel").grid(row=2, column=0, sticky="w", pady=3)
+        seg = ttk.Frame(g, style="Card.TFrame")
+        seg.grid(row=2, column=1, columnspan=3, sticky="w", pady=3)
+        for m in MODES:
+            ttk.Radiobutton(seg, text=m, value=m, variable=self.mode, style=f"{k}.Seg.Toolbutton",
+                            command=self._mode_changed).pack(side="left")
+        self.mode_info = ttk.Label(g, text="", style="Muted.Card.TLabel", wraplength=600)
+        self.mode_info.grid(row=3, column=1, columnspan=3, sticky="w")
+        self.trigger.trace_add("write", lambda *a: self._mode_changed())
+        foot = ttk.Frame(cfg, style="Card.TFrame")
+        foot.pack(fill="x", pady=(8, 0))
+        ttk.Label(foot, text=f"This laptop  {local_ip()}", style="Muted.Card.TLabel").pack(side="left")
+        self.btn = ttk.Button(foot, text="Start relay", style=f"{k}.Accent.TButton", command=self.start)
+        self.btn.pack(side="right")
+        self._mode_changed()
 
-        heard = ttk.LabelFrame(f, text="Intercepted voice (what the middle laptop hears)", padding=8)
-        heard.pack(fill="x", pady=8)
-        self.heard = tk.Listbox(heard, height=5)
-        self.heard.pack(side="left", fill="both", expand=True)
-        hb = ttk.Frame(heard)
-        hb.pack(side="left", padx=6)
-        ttk.Button(hb, text="▶ Play", command=self.play_intercepted).pack(fill="x")
-        ttk.Button(hb, text="■ Stop", command=audio.stop_playback).pack(fill="x", pady=4)
-        ttk.Button(hb, text="Cryptanalysis lab…", command=lambda: open_lab(self.root)).pack(fill="x")
-        self.relay = None
+        tiles = ttk.Frame(root, padding=(16, 0, 16, 10))
+        tiles.pack(fill="x")
+        self.tiles = {}
+        for i, (key, title) in enumerate((("frames", "Frames seen"), ("bytes", "Intercepted"),
+                                          ("entropy", "Entropy"))):
+            f, val, note = _tile(tiles, title, self.accent)
+            f.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
+            tiles.columnconfigure(i, weight=1, uniform="tile")
+            self.tiles[key] = (val, note)
+        self.tiles["entropy"][1].configure(text="bits per byte · 8.000 = random")
 
-        self.log = self._make_log(f)
-        self.log.pack(fill="both", expand=True, pady=(8, 0))
-        self.root.after(1000, self._refresh_heard)
+        heard = _card(root, "Intercepted voice · what the middle laptop hears")
+        hr = ttk.Frame(heard, style="Card.TFrame")
+        hr.pack(fill="both", expand=True)
+        wrap, self.heard = _listbox(hr, 3)
+        wrap.pack(side="left", fill="both", expand=True)
+        self.heard.bind("<Double-Button-1>", lambda e: self.play_intercepted())
+        hb = ttk.Frame(hr, style="Card.TFrame")
+        hb.pack(side="left", padx=(10, 0), anchor="n")
+        ttk.Button(hb, text="▶  Play", command=self.play_intercepted).pack(fill="x")
+        ttk.Button(hb, text="■  Stop", command=audio.stop_playback).pack(fill="x", pady=(6, 0))
+        ttk.Button(hb, text="Cryptanalysis lab…", command=lambda: open_lab(self.root)).pack(fill="x", pady=(6, 0))
 
-    def _refresh_heard(self):
-        if self.relay:
-            items = list(self.relay.intercepted)
-            self.heard.delete(0, "end")
-            for m in items:
-                self.heard.insert("end", m.label())
-        self.root.after(1000, self._refresh_heard)
+        act = _card(root, "Activity", fill="both", expand=True, pady=(0, 16))
+        self.log = self._make_log(act, height=6)
+        self.log.pack(fill="both", expand=True)
+        self._refresh()
+
+    def _mode_changed(self):
+        text = MODE_INFO.get(self.mode.get(), "").format(n=self.trigger.get() or "?")
+        self.mode_info.configure(text=text, foreground=C["muted"] if self.mode.get() == "observe" else WARN)
+
+    def _refresh(self):
+        r = self.relay
+        if r:
+            items = list(r.intercepted)
+            if self.heard.size() != len(items) or (items and self._last_label != items[-1].label()):
+                sel = self.heard.curselection()
+                self.heard.delete(0, "end")
+                for m in items:
+                    self.heard.insert("end", "  " + m.label())
+                for i in sel:
+                    self.heard.selection_set(i)
+                self._last_label = items[-1].label() if items else ""
+            frames = sum(m.frames for m in items)
+            size = sum(len(m.data) for m in items)
+            self.tiles["frames"][0].configure(text=f"{frames:,}")
+            self.tiles["frames"][1].configure(text=f"{len(items)} voice message(s)")
+            self.tiles["bytes"][0].configure(text=f"{size / 1e6:.2f} MB" if size >= 1e5 else f"{size / 1e3:.1f} KB")
+            self.tiles["bytes"][1].configure(text=f"≈ {size / 32000:.0f} s of audio" if size else "nothing yet")
+            if items and size != self._entropy_cache[0]:
+                sample = bytes(items[-1].data[-400_000:])
+                self._entropy_cache = (size, shannon_entropy(sample))
+            if items:
+                e = self._entropy_cache[1]
+                self.tiles["entropy"][0].configure(text=f"{e:.3f}", foreground=GOOD if e > 7.9 else WARN)
+            if r.done.is_set():
+                self.pill.set("Finished", MUTED)
+            elif items:
+                self.pill.set(f"Intercepting · {self.mode.get()}", self.accent)
+        self.root.after(700, self._refresh)
 
     def play_intercepted(self):
         sel = self.heard.curselection()
@@ -408,18 +717,23 @@ class RelayApp(_QueuedApp):
         except ValueError as e:
             messagebox.showerror("Settings", str(e))
             return
-        self.relay = relay
+        self.relay, self._last_label = relay, ""
         self.btn.configure(state="disabled")
+        self.pill.set(f"Listening · :{self.lport.get()}", WARN)
 
         def run():
             try:
                 relay.serve_once()
             except Exception as e:
                 self.post(self._append, self.log, f"[relay] error: {e}")
+                self.post(self.pill.set, "Error", BAD)
             self.post(lambda: self.btn.configure(state="normal"))
         threading.Thread(target=run, daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# Cryptanalysis lab
+# ---------------------------------------------------------------------------
 ATTACK_INFO = {
     "Ciphertext-only": "The attacker has only the ciphertext, exactly what the middle laptop "
                        "captures. Tools: brute force over all keys, byte statistics, and a "
@@ -438,47 +752,67 @@ class LabApp(_QueuedApp):
 
     def __init__(self, root):
         super().__init__(root)
-        root.title("SecureVoice – Cryptanalysis lab (offline, on your own recording)")
-        self.results, self.pcm, self.rate, self.ch = [], b"", 16000, 1
-        f = ttk.Frame(root, padding=10)
-        f.pack(fill="both", expand=True)
+        root.title("SecureVoice – Cryptanalysis lab")
+        k = self.k = _accent_styles(root, "lab")
+        self.accent = ACCENTS["lab"]
+        self.results, self.pcm, self.rate, self.ch, self.known_secs = [], b"", 16000, 1, 0.5
+        self.pill = _header(root, self.accent, "Cryptanalysis lab · offline, on your own recording")
+        self.pill.set("Ready", MUTED)
 
-        cfg = ttk.LabelFrame(f, text="Experiment", padding=8)
-        cfg.pack(fill="x")
+        cfg = _card(root, "Experiment")
+        g = ttk.Frame(cfg, style="Card.TFrame")
+        g.pack(fill="x")
+        g.columnconfigure(1, weight=1)
         self.path = tk.StringVar(value=self._latest_recording())
         self.secs = tk.StringVar(value="20")
         self.known = tk.StringVar(value="0.5")
-        ttk.Label(cfg, text="Recording (WAV)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(cfg, textvariable=self.path, width=46).grid(row=0, column=1, columnspan=3, sticky="we")
-        ttk.Button(cfg, text="Browse…", command=self._browse).grid(row=0, column=4, padx=4)
-        ttk.Label(cfg, text="Use first (s)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(cfg, textvariable=self.secs, width=6).grid(row=1, column=1, sticky="w")
-        ttk.Label(cfg, text="Attacker knows first (s)").grid(row=1, column=2, sticky="e")
-        ttk.Entry(cfg, textvariable=self.known, width=6).grid(row=1, column=3, sticky="w")
-        self.run_btn = ttk.Button(cfg, text="Run all attacks", command=self.run)
-        self.run_btn.grid(row=1, column=4, padx=4)
-        self.status = ttk.Label(cfg, text="Keys are random for each run. Nothing is sent on the network.")
-        self.status.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Label(g, text="Recording (WAV)", style="Muted.Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=3)
+        ttk.Entry(g, textvariable=self.path, style=f"{k}.TEntry").grid(row=0, column=1, columnspan=3, sticky="we")
+        ttk.Button(g, text="Browse…", command=self._browse).grid(row=0, column=4, padx=(8, 0))
+        ttk.Label(g, text="Use first (s)", style="Muted.Card.TLabel").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(g, textvariable=self.secs, style=f"{k}.TEntry", width=6).grid(row=1, column=1, sticky="w")
+        ttk.Label(g, text="Attacker knows first (s)", style="Muted.Card.TLabel").grid(row=1, column=2, sticky="e", padx=(0, 12))
+        ttk.Entry(g, textvariable=self.known, style=f"{k}.TEntry", width=6).grid(row=1, column=3, sticky="w")
+        self.run_btn = ttk.Button(g, text="Run all attacks", style=f"{k}.Accent.TButton", command=self.run)
+        self.run_btn.grid(row=1, column=4, padx=(8, 0))
+        self.status = ttk.Label(cfg, text="Keys are random for each run · nothing is sent on the network",
+                                style="Muted.Card.TLabel")
+        self.status.pack(anchor="w", pady=(6, 0))
 
+        body = ttk.Frame(root, padding=(16, 0, 16, 16))
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", padx=(10, 0))
+
+        res = _card(left, "Results · select a row", fill="both", expand=True, pady=0, padx=0)
         cols = ("layers", "attack", "result", "recovered", "time")
-        self.tree = ttk.Treeview(f, columns=cols, show="headings", height=9)
-        for c, title, w in zip(cols, ("Layers", "Attack", "Result", "Voice recovered", "Time"),
-                               (230, 140, 120, 120, 70)):
-            self.tree.heading(c, text=title)
+        self.tree = ttk.Treeview(res, columns=cols, show="headings", height=9, selectmode="browse")
+        for c, title, w in zip(cols, ("LAYERS", "ATTACK", "RESULT", "RECOVERED", "TIME"),
+                               (220, 135, 105, 95, 65)):
+            self.tree.heading(c, text=title, anchor="w")
             self.tree.column(c, width=w, anchor="w")
         self.tree.tag_configure("broken", foreground=BAD)
         self.tree.tag_configure("safe", foreground=GOOD)
-        self.tree.pack(fill="x", pady=8)
+        self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_detail())
+        btns = ttk.Frame(res, style="Card.TFrame")
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="▶  Play original", command=self.play_original).pack(side="left")
+        ttk.Button(btns, text="▶  Play attacker's result", command=self.play_result).pack(side="left", padx=8)
+        ttk.Button(btns, text="■  Stop", command=audio.stop_playback).pack(side="left")
 
-        btns = ttk.Frame(f)
-        btns.pack(fill="x")
-        ttk.Button(btns, text="▶ Play original", command=self.play_original).pack(side="left")
-        ttk.Button(btns, text="▶ Play what the attacker recovered", command=self.play_result).pack(side="left", padx=6)
-        ttk.Button(btns, text="■ Stop", command=audio.stop_playback).pack(side="left")
-
-        self.detail = _ScrolledText(f, height=8, wrap="word", font=MONO, state="disabled")
-        self.detail.pack(fill="both", expand=True, pady=(8, 0))
+        self.tiles = {}
+        for key, title in (("classic", "Without AES"), ("aes", "With AES")):
+            f, val, note = _tile(right, title, self.accent)
+            f.pack(fill="x", pady=(0, 10))
+            self.tiles[key] = (val, note)
+        det = _card(right, "Details", fill="both", expand=True, pady=0, padx=0)
+        self.detail = _ScrolledText(det, width=42, height=6, wrap="word", font=F["small"], state="disabled",
+                                    spacing1=2, spacing3=2)
+        self.detail.tag_configure("h", foreground=self.accent, font=F["bold"])
+        self.detail.pack(fill="both", expand=True)
 
     @staticmethod
     def _latest_recording() -> str:
@@ -506,24 +840,37 @@ class LabApp(_QueuedApp):
         self.rate, self.ch, self.known_secs = rate, ch, known
         self.results = []
         self.tree.delete(*self.tree.get_children())
+        for val, note in self.tiles.values():
+            val.configure(text="–", foreground=C["fg"])
+            note.configure(text="")
         self.run_btn.configure(state="disabled")
-        self.status.configure(text="Running… (the two pattern searches take a few seconds each)")
+        self.pill.set("Running…", WARN)
+        self.status.configure(text="Running… the two pattern searches take a few seconds each")
         known_bytes = int(rate * known) * ch * 2
 
         def work():
             try:
                 analysis.run_attacks(self.pcm, known_bytes, on_result=lambda r: self.post(self._add, r))
-                self.post(self.status.configure, {"text": "Done. Select a row for details; play the result to hear it."})
+                self.post(self.status.configure, {"text": "Done · select a row for details, then play the result"})
+                self.post(self.pill.set, "Done", GOOD)
             except Exception as e:
                 self.post(self.status.configure, {"text": f"Error: {e}"})
+                self.post(self.pill.set, "Error", BAD)
             self.post(lambda: self.run_btn.configure(state="normal"))
         threading.Thread(target=work, daemon=True).start()
 
     def _add(self, r):
         self.results.append(r)
         self.tree.insert("", "end", iid=str(len(self.results) - 1), tags=("broken" if r["success"] else "safe",),
-                         values=(r["case"], r["attack"], "BROKEN" if r["success"] else "resisted",
-                                 f"{r['recovered']:.0%}", f"{r['secs']:.2f}s"))
+                         values=(r["case"], r["attack"], "✗ BROKEN" if r["success"] else "✓ resisted",
+                                 f"{r['recovered']:.0%}", f"{r['secs']:.2f} s"))
+        for key, group in (("classic", [x for x in self.results if x["layers"] < 3]),
+                           ("aes", [x for x in self.results if x["layers"] == 3])):
+            if group:
+                broken = sum(x["success"] for x in group)
+                val, note = self.tiles[key]
+                val.configure(text=f"{broken} / {len(group)} broken", foreground=BAD if broken else GOOD)
+                note.configure(text="voice recovered by the attacker" if broken else "attacker hears only noise")
 
     def _selected(self):
         sel = self.tree.selection()
@@ -533,16 +880,17 @@ class LabApp(_QueuedApp):
         r = self._selected()
         if not r:
             return
-        text = (f"{r['attack']} attack on {r['case']}\n\n"
-                f"Attacker's position: {ATTACK_INFO[r['attack']].format(known=self.known_secs)}\n\n"
-                f"What happened: {r['detail']}.\n\n"
-                f"Key the attacker found: {r['key']}\nReal key:              {r['real_key']}"
-                + ("\n(A different but equivalent Affine key gives the same audio with inverted polarity.)"
-                   if r["success"] and r["key"].split(" cols")[0] != r["real_key"].split(" cols")[0] else "")
-                + f"\n\nVoice recovered: {r['recovered']:.0%} (correlation with the original).")
+        equiv = (r["success"] and r["key"].split(" cols")[0] != r["real_key"].split(" cols")[0])
         self.detail.configure(state="normal")
         self.detail.delete("1.0", "end")
-        self.detail.insert("end", text)
+        self.detail.insert("end", f"{r['attack']} attack on {r['case']}\n\n", ("h",))
+        self.detail.insert("end", f"Attacker's position: {ATTACK_INFO[r['attack']].format(known=self.known_secs)}\n\n"
+                                  f"What happened: {r['detail']}.\n\n"
+                                  f"Key the attacker found: {r['key']}\n"
+                                  f"Real key:               {r['real_key']}\n"
+                           + ("(A different but equivalent Affine key gives the same audio with inverted polarity.)\n"
+                              if equiv else "")
+                           + f"\nVoice recovered: {r['recovered']:.0%} (correlation with the original).")
         self.detail.configure(state="disabled")
 
     def play_original(self):

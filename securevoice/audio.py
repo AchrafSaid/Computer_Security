@@ -17,11 +17,19 @@ class Recorder:
         self._stream = None
         self._recording = False
         self._lock = threading.Lock()
+        self.level = 0.0                 # 0..1 loudness of the latest block (for the GUI meter)
 
     def _cb(self, indata, frames, t, status):
+        block = bytes(indata)
         with self._lock:
             if self._recording:
-                self._chunks.append(bytes(indata))
+                self._chunks.append(block)
+        try:
+            import numpy as np
+            x = np.frombuffer(block, dtype=np.int16).astype(np.float32)
+            self.level = min(1.0, float(np.sqrt(np.mean(x * x))) / 6000.0) if len(x) else 0.0
+        except Exception:
+            pass
 
     def start(self) -> None:
         import sounddevice as sd
@@ -40,6 +48,7 @@ class Recorder:
             self._recording = False
             data = b"".join(self._chunks)
             self._chunks = []
+        self.level = 0.0
         stream, self._stream = self._stream, None
         if stream is not None:
             def shutdown():
