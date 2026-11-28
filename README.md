@@ -82,8 +82,8 @@ Active:
 - `tamper` / `replay` / `drop`: corrupt / re-send / delete one DATA frame. With a strong
   key the attacker has no key, so the destination's AES-GCM / sequence checks **reject**
   the message (a **SECURITY ALERT**). This shows the defence working.
-- `forge`: when the source starts transmitting, the relay **detects it**, drops the real
-  message, and brute-forces the PIN. The attacker then **records a fake live** (press
+- `forge`: when a peer starts transmitting (either direction), the relay **detects it**,
+  drops the real message, and brute-forces the PIN. The attacker then **records a fake live** (press
   ●  Record → ■  Stop & inject) — or pre-stages one with *Browse…* — and it is re-encrypted
   with the recovered key and sent to the destination. Because the attacker holds the key,
   the forged frames pass every check, so the destination plays the fake and **neither side

@@ -230,6 +230,37 @@ def test_relay_forge_injects_fake():
     assert relay.cracked_pin == WEAK_PIN
 
 
+def test_relay_crack_reassembles_split_bursts():
+    """A slow network splits one voice message into several time-bursts; the
+    attacker must still reassemble the FULL audio, not just the first second."""
+    from securevoice.relay import Intercepted
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")
+    dport, t, _ = start_dest(dst)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "crack", capture_dir=None, on_log=lambda s: None)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+    pcm = tone(5.0, 440)                       # ~160 KB -> several 32 KB chunks
+    src.send_voice(pcm, RATE)
+    assert wait_for(lambda: hd.voices)
+    src.close(); dst.close()
+    assert wait_for(lambda: relay.done.is_set(), 8)
+    # simulate WiFi fragmentation: scatter the A->B frames into one-frame bursts
+    frames = [f for m in relay.intercepted if m.direction == "A->B" for f in m.frames_data]
+    assert len(frames) > 2
+    scattered = []
+    for fr in frames:
+        piece = Intercepted("A->B")
+        piece.frames_data = [fr]
+        piece.data += fr[1]
+        scattered.append(piece)
+    relay.intercepted, relay.recovered = scattered, []
+    recovered = relay.recover_all()
+    assert any(p == pcm for _, p, _ in recovered), "full audio not reassembled from split bursts"
+
+
 def test_relay_forge_live_inject():
     """Live forge: the relay starts with NO pre-staged fake. When the source
     transmits, the relay detects it (source_transmitting); the attacker then

@@ -128,9 +128,12 @@ class InspectionRelay:
         self._cracked = False
         self._crack_failed = False
         self._forged = False
-        self.source_transmitting = False     # True once the real source starts sending (forge)
-        self.injected = False                # True once a fake has been sent to the destination
-        self._dst_sock = None                # destination socket, so a fake can be injected later
+        self.source_transmitting = False     # True once a peer starts sending (forge)
+        self.injected = False                # True once a fake has been sent
+        self._dst_sock = None                # destination socket (b)
+        self._forge_dst = None               # where the fake goes (the forged direction's dst)
+        self._forge_dir_byte = P.DIR_INITIATOR
+        self._saved_count = 0                # recovered WAVs already written
         self._inject_lock = threading.Lock()
         self._crack_lock = threading.Lock()
         self.cracked_pin: Optional[str] = None
@@ -218,20 +221,20 @@ class InspectionRelay:
         return self.aes_key
 
     def inject_fake(self, pcm: bytes, rate: int = 16000) -> bool:
-        """Send the attacker's fake message to the destination, encrypted with the
-        recovered key as DIR_INITIATOR (seq 0..), so it looks like the real source.
-        Called live from the GUI once the attacker has recorded a fake. One per run."""
+        """Send the attacker's fake message to the peer on the far side of the
+        forged direction, encrypted with the recovered key (seq 0..) so it looks
+        like the real sender. Called live from the GUI once a fake is ready."""
         with self._inject_lock:
             if self.injected:
                 return False
             key = self._ensure_cracked()
-            if not key or not self._dst_sock or not pcm:
+            if not key or not self._forge_dst or not pcm:
                 return False
-            self._emit_forged(self._dst_sock, pcm, rate)
+            self._emit_forged(self._forge_dst, pcm, rate, self._forge_dir_byte)
             self.injected = True
             return True
 
-    def _emit_forged(self, dst: socket.socket, pcm: bytes, rate: int) -> None:
+    def _emit_forged(self, dst: socket.socket, pcm: bytes, rate: int, dir_byte: int) -> None:
         from .peer import K_BEGIN, K_CHUNK, K_END, CHUNK
         from .crypto_layers import AESLayer
         import hashlib
@@ -240,8 +243,7 @@ class InspectionRelay:
 
         def emit(pt: bytes):
             nonlocal seq
-            ct = aes.encrypt(pt, P.data_nonce(P.DIR_INITIATOR, seq),
-                             P.data_aad(P.DIR_INITIATOR, seq))
+            ct = aes.encrypt(pt, P.data_nonce(dir_byte, seq), P.data_aad(dir_byte, seq))
             P.send_frame(dst, P.T_DATA, seq.to_bytes(8, "big") + ct)
             seq += 1
 
@@ -253,14 +255,16 @@ class InspectionRelay:
             emit(bytes([K_CHUNK]) + mid + pcm[i:i + CHUNK])
         emit(bytes([K_END]) + mid)
         self.on_log(f"[relay] *** FORGED a fake voice message ({len(pcm)} bytes, "
-                    f"{seq} frames) and sent it to the destination as the real source ***")
+                    f"{seq} frames) and sent it to the receiver as the real sender ***")
 
     def recover_all(self) -> list:
-        """Brute-force the PIN (once) and decrypt every captured message into the
-        real audio the victim sent. Safe to call live from the GUI (e.g. the
-        'Decrypted' button) or automatically when the session ends."""
+        """Brute-force the PIN (once) and decrypt the captured ciphertext into the
+        real voice. Collects every DATA frame per direction — one voice message can
+        be split across several time-bursts on a slow network — decrypts them in
+        sequence order and reassembles whole messages by their K_BEGIN/K_CHUNK/K_END
+        markers. Returns [(direction, pcm, rate), ...]. Safe to call live."""
         if not self.intercepted:
-            self.on_log("[relay] nothing captured yet — have the source send a message first")
+            self.on_log("[relay] nothing captured yet — have a peer send a message first")
             return []
         if not self._cracked and not self._handshake_ready():
             self.on_log("[relay] handshake not captured yet — wait for the peers to connect")
@@ -268,29 +272,46 @@ class InspectionRelay:
         key = self._ensure_cracked()
         if not key:
             return []
-        from .audio import save_wav
-        if self.capture_dir:
-            os.makedirs(self.capture_dir, exist_ok=True)
+        from .crypto_layers import AESLayer
+        from .peer import K_BEGIN, K_CHUNK, K_END
+        aes = AESLayer(key)
         with self._lock:
-            items = list(self.intercepted)
+            bursts = list(self.intercepted)
+        frames_by_dir = {}
+        for m in bursts:
+            frames_by_dir.setdefault(m.direction, {}).update(m.frames_data)   # seq -> ct, deduped
         out = []
-        for i, m in enumerate(items, 1):
-            try:
-                pcm, meta = m.decrypt(key)
-            except Exception as e:                       # noqa: BLE001 (report and continue)
-                self.on_log(f"[relay] could not decrypt message {i}: {e}")
-                continue
-            if not pcm:
-                continue
-            rate = int(meta.get("rate", 16000)) if meta else 16000
-            out.append((m, pcm, rate))
-            if self.capture_dir and not getattr(m, "_saved", False):
-                path = os.path.join(self.capture_dir, time.strftime(
-                    f"recovered_%H%M%S_{i}.wav", time.localtime(m.started)))
-                save_wav(path, pcm, rate)
-                m._saved = True
-                self.on_log(f"[relay] decrypted the REAL voice the victim sent → {path} "
-                            f"({len(pcm)} bytes, {len(pcm) / 2 / rate:.1f}s)")
+        for direction, fmap in frames_by_dir.items():
+            dir_byte = DIR_OF.get(direction, P.DIR_INITIATOR)
+            msg, meta = None, None
+            for seq in sorted(fmap):
+                try:
+                    pt = aes.decrypt(fmap[seq], P.data_nonce(dir_byte, seq),
+                                     P.data_aad(dir_byte, seq))
+                except Exception:                         # a torn/padding frame: skip it
+                    continue
+                kind, body = pt[0], pt[1:]
+                if kind == K_BEGIN:
+                    msg, meta = bytearray(), json.loads(body)
+                elif kind == K_CHUNK and msg is not None:
+                    msg += body[4:]
+                elif kind == K_END and msg is not None:
+                    rate = int(meta.get("rate", 16000)) if meta else 16000
+                    out.append((direction, bytes(msg), rate))
+                    msg, meta = None, None
+            if msg:                                       # message captured without its K_END
+                rate = int(meta.get("rate", 16000)) if meta else 16000
+                out.append((direction, bytes(msg), rate))
+        if self.capture_dir and out:
+            from .audio import save_wav
+            os.makedirs(self.capture_dir, exist_ok=True)
+            for i, (direction, pcm, rate) in enumerate(out, 1):
+                if i > self._saved_count:
+                    path = os.path.join(self.capture_dir, time.strftime(f"recovered_%H%M%S_{i}.wav"))
+                    save_wav(path, pcm, rate)
+                    self.on_log(f"[relay] decrypted the REAL voice ({direction}) → {path} "
+                                f"({len(pcm)} bytes, {len(pcm) / 2 / rate:.1f}s)")
+            self._saved_count = max(self._saved_count, len(out))
         self.recovered = out
         return out
 
@@ -343,7 +364,6 @@ class InspectionRelay:
         buf = bytearray()
         data_count = 0
         history = []
-        forging = apply_mode and self.mode == "forge"
         try:
             while True:
                 chunk = src.recv(65536)
@@ -368,17 +388,25 @@ class InspectionRelay:
                         if data_count <= 3 or data_count % 20 == 0:
                             self.on_log(f"[relay] {label} DATA seq={seq} {len(ct)}B "
                                         f"entropy={shannon_entropy(ct):.3f} bits/byte")
-                        if forging:
-                            # drop the real message; the attacker records and injects a fake
-                            out = []
-                            if not self._forged:
-                                self._forged = True
+                        if self.mode == "forge":
+                            # the FIRST direction to send is forged (dropped + faked);
+                            # the other direction keeps flowing normally
+                            with self._lock:
+                                claim = not self._forged
+                                if claim:
+                                    self._forged = True
+                                    self._forge_dst = dst
+                                    self._forge_dir_byte = DIR_OF.get(label, P.DIR_INITIATOR)
+                            if claim:
+                                out = []
                                 self.source_transmitting = True
-                                self.on_log("[relay] *** SOURCE IS TRANSMITTING — intercepting and "
+                                self.on_log(f"[relay] *** {label} IS TRANSMITTING — intercepting and "
                                             "dropping the real message; record a fake and inject it ***")
                                 self._ensure_cracked()
                                 if self.fake_pcm:        # pre-staged fake: inject right away
                                     self.inject_fake(self.fake_pcm, self.fake_rate)
+                            elif DIR_OF.get(label) == self._forge_dir_byte:
+                                out = []                 # keep dropping the forged direction
                         elif apply_mode and data_count == self.trigger_frame:
                             out = self._apply(raw, history)
                         history.append(raw)

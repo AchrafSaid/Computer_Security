@@ -606,7 +606,7 @@ MODE_INFO = {
     "tamper": "Active · flips one bit in DATA frame #{n} · with a strong key the receiver rejects it (integrity check)",
     "replay": "Active · re-sends an earlier frame at DATA frame #{n} · the receiver rejects it (sequence check)",
     "drop": "Active · deletes DATA frame #{n} · the receiver rejects the message (missing frame)",
-    "forge": "Active · detects the source, drops the real message, and injects a fake you record live · the receiver accepts it as genuine",
+    "forge": "Active · detects the sender (either direction), drops the real message, and injects a fake you record live · the receiver accepts it as genuine",
 }
 
 
@@ -806,25 +806,18 @@ class RelayApp(_QueuedApp):
         r = self.relay
         if not r:
             return
-        sel = self.heard.curselection()
-        idx = sel[0] if sel else None
-        target = r.intercepted[idx] if (idx is not None and idx < len(r.intercepted)) else None
         self.post(self._append, self.log, "[relay] brute-forcing the PIN and decrypting…")
         if not r.recovered:
             self.post(self.pill.set, "Brute-forcing…", WARN)
 
         def work():
-            recovered = r.recovered or r.recover_all()     # crack + decrypt on demand
+            recovered = r.recover_all()        # always refresh: full length, picks up new messages
             if not recovered:
-                return                                     # recover_all() already logged why
-            pcm, rate = recovered[-1][1], recovered[-1][2]
-            for m, p, rt in recovered:
-                if m is target:
-                    pcm, rate = p, rt
-                    break
+                return                         # recover_all() already logged why
+            direction, pcm, rate = recovered[-1]   # the most recent complete message
             self.post(self._append, self.log,
-                      f"[relay] playing the DECRYPTED real voice ({len(pcm) / 2 / rate:.1f}s) – "
-                      f"recovered with the cracked PIN {r.cracked_pin}")
+                      f"[relay] playing the DECRYPTED real voice ({direction}, "
+                      f"{len(pcm) / 2 / rate:.1f}s) – recovered with the cracked PIN {r.cracked_pin}")
             audio.play(pcm, rate)
         threading.Thread(target=work, daemon=True).start()
 
