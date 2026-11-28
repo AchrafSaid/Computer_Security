@@ -618,6 +618,10 @@ class RelayApp(_QueuedApp):
         self.accent = ACCENTS["relay"]
         self.relay = None
         self._entropy_cache = (0, 0.0)
+        self.recorder = audio.Recorder()
+        self.rec_start = None
+        self.fake_pcm_recorded = None
+        self.fake_rate_recorded = audio.SAMPLE_RATE
         self.pill = _header(root, self.accent, f"Man in the middle · inspection relay · this laptop {local_ip()}")
         self.pill.set("Idle", MUTED)
 
@@ -649,6 +653,10 @@ class RelayApp(_QueuedApp):
         self.fake_path = tk.StringVar()
         self.fake_entry = ttk.Entry(fake, textvariable=self.fake_path, style=f"{k}.TEntry")
         self.fake_entry.pack(side="left", fill="x", expand=True)
+        self.fake_rec_btn = ttk.Button(fake, text="●  Record", width=12, command=self.toggle_fake_record)
+        self.fake_rec_btn.pack(side="left", padx=(8, 0))
+        self.fake_timer = ttk.Label(fake, text="", style="Muted.Card.TLabel")
+        self.fake_timer.pack(side="left", padx=(8, 0))
         self.fake_btn = ttk.Button(fake, text="Browse…", command=self._browse_fake)
         self.fake_btn.pack(side="left", padx=(8, 0))
         foot = ttk.Frame(cfg, style="Card.TFrame")
@@ -690,14 +698,42 @@ class RelayApp(_QueuedApp):
         p = filedialog.askopenfilename(filetypes=[("WAV audio", "*.wav")], initialdir="received")
         if p:
             self.fake_path.set(p)
+            self.fake_pcm_recorded = None          # a chosen file overrides any recording
+
+    def toggle_fake_record(self):
+        if self.rec_start is None:
+            try:
+                self.recorder.start()
+            except Exception as e:
+                messagebox.showerror("Microphone", str(e))
+                return
+            self.rec_start = time.time()
+            self.fake_rec_btn.configure(text="■  Stop")
+            self.fake_timer.configure(foreground=BAD)
+            self._fake_tick()
+        else:
+            pcm = self.recorder.stop()
+            self.rec_start = None
+            self.fake_rec_btn.configure(text="●  Record")
+            self.fake_pcm_recorded = pcm
+            self.fake_rate_recorded = audio.SAMPLE_RATE
+            secs = len(pcm) / (audio.SAMPLE_RATE * audio.SAMPLE_WIDTH)
+            self.fake_path.set(f"[recorded {secs:.1f}s from mic]")
+            self.fake_timer.configure(text=f"{secs:.1f}s ready", foreground=C["muted"])
+
+    def _fake_tick(self):
+        if self.rec_start is not None:
+            s = int(time.time() - self.rec_start)
+            self.fake_timer.configure(text=f"{s // 60:02d}:{s % 60:02d}")
+            self.root.after(100, self._fake_tick)
 
     def _mode_changed(self):
         mode = self.mode.get()
         text = MODE_INFO.get(mode, "").format(n=self.trigger.get() or "?")
         self.mode_info.configure(text=text, foreground=C["muted"] if mode == "observe" else WARN)
         state = "normal" if mode == "forge" else "disabled"
-        self.fake_entry.configure(state=state)
-        self.fake_btn.configure(state=state)
+        for w in (self.fake_entry, self.fake_btn, self.fake_rec_btn):
+            w.configure(state=state)
 
     def _refresh(self):
         r = self.relay
@@ -774,12 +810,20 @@ class RelayApp(_QueuedApp):
         mode = self.mode.get()
         fake_pcm, fake_rate = None, 16000
         if mode == "forge":
-            try:
-                fake_pcm, fake_rate, _, width = audio.load_wav(self.fake_path.get())
-            except Exception as e:
-                messagebox.showerror("Fake recording",
-                                     f"Forge mode needs a WAV file to inject.\n\n{e}")
+            if self.rec_start is not None:
+                messagebox.showerror("Fake recording", "Finish the fake recording first (press ■ Stop).")
                 return
+            if self.fake_pcm_recorded:
+                fake_pcm, fake_rate = self.fake_pcm_recorded, self.fake_rate_recorded
+            else:
+                try:
+                    fake_pcm, fake_rate, _, width = audio.load_wav(self.fake_path.get())
+                except Exception as e:
+                    messagebox.showerror("Fake recording",
+                                         "Forge mode needs a message to inject.\n"
+                                         "Record one here with ●  Record, or pick a WAV with Browse…\n\n"
+                                         f"{e}")
+                    return
         try:
             relay = InspectionRelay(int(self.lport.get()), self.dhost.get().strip(),
                                     int(self.dport.get()), mode, int(self.trigger.get()),
