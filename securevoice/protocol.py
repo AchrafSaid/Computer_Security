@@ -1,5 +1,5 @@
 """Wire protocol: length-prefixed frames, authenticated handshake and the
-secure channel that applies the three-layer cipher to every frame.
+secure channel that applies AES-256-GCM to every frame.
 
 Frame   = len(4, big-endian, covers type+payload) | type(1) | payload
 HELLO   = JSON {name, nonce}                 initiator -> responder  (plaintext)
@@ -41,6 +41,18 @@ class ProtocolError(Exception):
 
 class SecurityError(ProtocolError):
     """Raised when an integrity / authenticity check fails."""
+
+
+# ---------------- AES-GCM nonce / AAD for DATA frames ----------------
+# A DATA frame's nonce and additional authenticated data are derived from the
+# sending direction and the sequence number, so the relay can reconstruct them
+# too once it has cracked the key (see relay.py).
+def data_nonce(direction: int, seq: int) -> bytes:
+    return bytes([direction, 0, 0, 0]) + seq.to_bytes(8, "big")
+
+
+def data_aad(direction: int, seq: int) -> bytes:
+    return bytes([T_DATA, direction]) + seq.to_bytes(8, "big")
 
 
 # ---------------- framing ----------------
@@ -92,13 +104,8 @@ class SecureChannel:
         self._last_recv_seq = -1
         self._send_lock = threading.Lock()
 
-    @staticmethod
-    def _nonce(direction: int, seq: int) -> bytes:
-        return bytes([direction, 0, 0, 0]) + seq.to_bytes(8, "big")
-
-    @staticmethod
-    def _aad(direction: int, seq: int) -> bytes:
-        return bytes([T_DATA, direction]) + seq.to_bytes(8, "big")
+    _nonce = staticmethod(data_nonce)
+    _aad = staticmethod(data_aad)
 
     def send(self, plaintext: bytes) -> None:
         with self._send_lock:
@@ -162,10 +169,19 @@ def _read_json(sock, expected_type: int, what: str) -> dict:
         raise ProtocolError(f"malformed {what}")
 
 
-def _session(passphrase: str, name_i: str, name_r: str, nonce_i: bytes, nonce_r: bytes):
-    master = K.session_master(passphrase, nonce_i + nonce_r)
+def _session(passphrase: str, name_i: str, name_r: str, nonce_i: bytes, nonce_r: bytes,
+             iterations: int = K.PBKDF2_ITERATIONS):
+    master = K.session_master(passphrase, nonce_i + nonce_r, iterations)
     transcript = _transcript(name_i, name_r, nonce_i, nonce_r)
     return K.auth_key(master), transcript, K.derive_layer_keys(master, transcript)
+
+
+def recompute_session(passphrase: str, name_i: str, name_r: str,
+                      nonce_i: bytes, nonce_r: bytes, iterations: int = K.PBKDF2_ITERATIONS):
+    """Public wrapper over _session: given a candidate passphrase and the handshake
+    nonces/names, return (auth_key, transcript, layer_keys). The relay uses this to
+    test guessed passphrases and, on a hit, to derive the AES key."""
+    return _session(passphrase, name_i, name_r, nonce_i, nonce_r, iterations)
 
 
 def handshake_initiator(sock, passphrase: str, name: str) -> SecureChannel:

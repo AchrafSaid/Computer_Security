@@ -171,6 +171,60 @@ def test_relay_hears_noise_not_speech(ids):
     ("drop", "missing frame"),
 ])
 def test_relay_attacks_detected(ids, mode, expected):
+    """Keyless active attacks (strong passphrase) are caught by AES-GCM / sequencing."""
     hd, pcm, logs = run_via_relay(ids, mode)
     assert not hd.voices, "modified stream must not be delivered"
     assert any(expected in l for l in hd.logs), hd.logs
+
+
+# ------- Weak-key man-in-the-middle: brute-force the PIN, then decrypt / forge -------
+WEAK_PIN = "1234"
+
+
+def test_relay_crack_recovers_original():
+    """Passive: with a 4-digit PIN the relay brute-forces the key and decrypts the
+    voice. The message still reaches the destination unchanged (nobody notices)."""
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")
+    dport, t, _ = start_dest(dst)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "crack", capture_dir=None, on_log=lambda s: None)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+    pcm = tone(2.0, 440)
+    src.send_voice(pcm, RATE)
+    assert wait_for(lambda: hd.voices)
+    assert hd.voices[0].pcm == pcm                      # delivered unchanged: passive tap
+    src.close(); dst.close()
+    assert wait_for(lambda: relay.done.is_set(), 8)
+    assert relay.cracked_pin == WEAK_PIN                # key recovered by brute force
+    assert relay.recovered and relay.recovered[0][1] == pcm   # attacker decrypted the real audio
+
+
+def test_relay_forge_injects_fake():
+    """Active: the relay cracks the PIN, drops the real message and sends a fake one
+    that the destination accepts as genuine -- no security alert, no one notices."""
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")
+    dport, t, _ = start_dest(dst)
+    fake = tone(1.0, 880)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "forge", capture_dir=None,
+                            on_log=lambda s: None, fake_pcm=fake, fake_rate=RATE)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+    real = tone(2.0, 440)
+    try:
+        src.send_voice(real, RATE)
+    except OSError:
+        pass
+    assert wait_for(lambda: hd.voices)
+    got = hd.voices[0]
+    assert got.pcm == fake and got.pcm != real          # destination plays the fake message
+    assert got.sender == "alice"                         # and believes it came from the real source
+    assert not any("SECURITY" in l for l in hd.logs)     # no integrity alert raised
+    src.close(); dst.close()
+    assert wait_for(lambda: relay.done.is_set(), 8)
+    assert relay.cracked_pin == WEAK_PIN

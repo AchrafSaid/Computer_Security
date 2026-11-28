@@ -78,9 +78,9 @@ class Peer:
     def _start(self, channel: P.SecureChannel) -> None:
         self.channel = channel
         lk = channel.layer_keys
+        key_id = hashlib.sha256(lk.aes).hexdigest()[:8]
         self.on_log(f"Secure session with '{channel.peer_name}' (shared passphrase verified by both sides)")
-        self.on_log(f"  L1 Affine a={lk.affine[0]} b={lk.affine[1]} | "
-                    f"L2 Transposition {lk.transposition} | L3 AES-256-GCM")
+        self.on_log(f"  Cipher: AES-256-GCM | session key id {key_id}")
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 

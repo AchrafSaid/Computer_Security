@@ -124,6 +124,23 @@ def test_passphrase_warning():
     assert K.passphrase_warning("correct horse battery staple") == ""
 
 
+def test_brute_force_recovers_weak_pin():
+    """A captured handshake with a 4-digit PIN is broken by brute force; the
+    recovered key is the real AES key. A strong passphrase is not found."""
+    from securevoice.analysis import brute_force_passphrase, pin_candidates
+    name_i, name_r = "alice", "bob"
+    ni, nr = os.urandom(16), os.urandom(16)
+    akey, transcript, lk = P.recompute_session("7391", name_i, name_r, ni, nr)
+    proof_r = K.proof(akey, b"R", transcript)                 # what the relay captures
+    r = brute_force_passphrase(name_i, name_r, ni, nr, proof_r)
+    assert r["success"] and r["passphrase"] == "7391" and r["aes_key"] == lk.aes
+    # a strong passphrase is not in the PIN space -> brute force fails
+    ak2, t2, _ = P.recompute_session("correct horse battery staple", name_i, name_r, ni, nr)
+    pr2 = K.proof(ak2, b"R", t2)
+    assert not brute_force_passphrase(name_i, name_r, ni, nr, pr2,
+                                      candidates=pin_candidates(4))["success"]
+
+
 def _handshake(pass_i, pass_r):
     a, b = socket.socketpair()
     out = {}

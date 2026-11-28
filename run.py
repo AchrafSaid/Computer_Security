@@ -1,9 +1,10 @@
 """Entry point.
 
     python run.py peer                            # source or destination laptop
-    python run.py relay                           # middle laptop (GUI)
+    python run.py relay                           # middle laptop / man in the middle (GUI)
     python run.py lab                             # offline cryptanalysis lab (GUI)
-    python run.py relay --cli --listen 12347 --dest 192.168.1.20 --dest-port 12348 --mode tamper
+    python run.py relay --cli --listen 12347 --dest 192.168.1.20 --dest-port 12348 --mode crack
+    python run.py relay --cli --mode forge --fake fake.wav --dest 192.168.1.20 --dest-port 12348
 """
 import argparse
 
@@ -22,6 +23,7 @@ def main():
     r.add_argument("--dest-port", type=int, default=DEFAULT_PORT + 1)
     r.add_argument("--mode", default="observe")
     r.add_argument("--trigger", type=int, default=5)
+    r.add_argument("--fake", default=None, help="WAV file to inject in forge mode")
     a = ap.parse_args()
 
     if a.cmd == "lab":
@@ -32,7 +34,12 @@ def main():
         run_peer()
     elif a.cli:
         from securevoice.relay import InspectionRelay
-        InspectionRelay(a.listen, a.dest, a.dest_port, a.mode, a.trigger).serve_once()
+        fake_pcm, fake_rate = None, 16000
+        if a.fake:
+            from securevoice.audio import load_wav
+            fake_pcm, fake_rate, _, _ = load_wav(a.fake)
+        InspectionRelay(a.listen, a.dest, a.dest_port, a.mode, a.trigger,
+                        fake_pcm=fake_pcm, fake_rate=fake_rate).serve_once()
     else:
         from securevoice.gui import run_relay
         run_relay()

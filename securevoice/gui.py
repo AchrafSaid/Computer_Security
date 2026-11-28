@@ -395,7 +395,7 @@ class PeerApp(_QueuedApp):
         self.host_entry.grid(row=2, column=1, sticky="w")
         self.host_hint = ttk.Label(g, text="", style="Muted.Card.TLabel")
         self.host_hint.grid(row=2, column=2, columnspan=2, sticky="w")
-        label("Shared passphrase", 3)
+        label("Shared PIN", 3)
         self.pass_entry = ttk.Entry(g, textvariable=self.passphrase, style=f"{k}.TEntry", show="•")
         self.pass_entry.grid(row=3, column=1, columnspan=2, sticky="we")
         ttk.Checkbutton(g, text="Show", variable=self.show_pass, style=f"{k}.TCheckbutton",
@@ -403,24 +403,24 @@ class PeerApp(_QueuedApp):
                         ).grid(row=3, column=3, sticky="w", padx=(12, 0))
         self._role_changed()
 
-        pipe = _card(self.root, "Encryption pipeline")
+        pipe = _card(self.root, "Encryption")
+        ttk.Label(pipe, text="Shared PIN → PBKDF2 key stretching → AES-256-GCM (one authenticated cipher)",
+                  style="Muted.Card.TLabel").pack(anchor="w", pady=(0, 8))
         row = ttk.Frame(pipe, style="Card.TFrame")
         row.pack(fill="x")
         self.chips = []
-        for i, title in enumerate(("Affine", "Row transposition", "AES-256-GCM")):
-            if i:
-                tk.Label(row, text="→", bg=C["card"], fg=C["muted"], font=F["base"]).pack(side="left", padx=8)
-            chip = tk.Frame(row, bg=C["field"], highlightthickness=1, highlightbackground=C["border"], bd=0)
-            chip.pack(side="left", fill="x", expand=True)
-            head = tk.Frame(chip, bg=C["field"])
-            head.pack(fill="x", padx=12, pady=(8, 0))
-            n = tk.Label(head, text=str(i + 1), bg=C["field"], fg=C["muted"], font=F["small"])
-            n.pack(side="left")
-            tk.Label(head, text=title, bg=C["field"], fg=C["secondary"], font=F["small"]).pack(side="left", padx=(8, 0))
-            v = tk.Label(chip, text="Waiting for a session", bg=C["field"], fg=C["muted"],
-                         font=F["mono_small"], anchor="w")
-            v.pack(fill="x", padx=12, pady=(4, 8))
-            self.chips.append((chip, n, v))
+        chip = tk.Frame(row, bg=C["field"], highlightthickness=1, highlightbackground=C["border"], bd=0)
+        chip.pack(side="left", fill="x", expand=True)
+        head = tk.Frame(chip, bg=C["field"])
+        head.pack(fill="x", padx=12, pady=(8, 0))
+        n = tk.Label(head, text="AES", bg=C["field"], fg=C["muted"], font=F["small"])
+        n.pack(side="left")
+        tk.Label(head, text="AES-256-GCM", bg=C["field"], fg=C["secondary"],
+                 font=F["small"]).pack(side="left", padx=(8, 0))
+        v = tk.Label(chip, text="Waiting for a session", bg=C["field"], fg=C["muted"],
+                     font=F["mono_small"], anchor="w")
+        v.pack(fill="x", padx=12, pady=(4, 8))
+        self.chips.append((chip, n, v))
 
         voice = _card(self.root, "Voice messages")
         vr = ttk.Frame(voice, style="Card.TFrame")
@@ -465,11 +465,9 @@ class PeerApp(_QueuedApp):
 
     def _set_chips(self, lk):
         if lk is None:
-            values = ["Waiting for a session"] * 3
+            values = ["Waiting for a session"]
         else:
-            values = [f"a={lk.affine[0]}  b={lk.affine[1]}",
-                      " ".join(map(str, lk.transposition)),
-                      f"256-bit key · id {hashlib.sha256(lk.aes).hexdigest()[:8].upper()}"]
+            values = [f"256-bit key · id {hashlib.sha256(lk.aes).hexdigest()[:8].upper()}"]
         for (chip, n, v), text in zip(self.chips, values):
             on = lk is not None
             n.configure(fg=self.accent if on else C["muted"])
@@ -603,10 +601,12 @@ class PeerApp(_QueuedApp):
 # Relay (man in the middle)
 # ---------------------------------------------------------------------------
 MODE_INFO = {
-    "observe": "Passive · forwards everything unchanged and measures the ciphertext",
-    "tamper": "Active · flips one bit in DATA frame #{n} · the receiver must reject it (integrity check)",
-    "replay": "Active · re-sends an earlier frame at DATA frame #{n} · the receiver must reject it (sequence check)",
-    "drop": "Active · deletes DATA frame #{n} · the receiver must reject the message (missing frame)",
+    "observe": "Passive · forwards everything unchanged and measures the ciphertext (noise)",
+    "crack": "Passive · brute-forces the shared PIN from the handshake, then decrypts the REAL voice · neither side notices",
+    "tamper": "Active · flips one bit in DATA frame #{n} · with a strong key the receiver rejects it (integrity check)",
+    "replay": "Active · re-sends an earlier frame at DATA frame #{n} · the receiver rejects it (sequence check)",
+    "drop": "Active · deletes DATA frame #{n} · the receiver rejects the message (missing frame)",
+    "forge": "Active · brute-forces the PIN, drops the real message and sends your fake recording · the receiver accepts it as genuine",
 }
 
 
@@ -643,6 +643,14 @@ class RelayApp(_QueuedApp):
         self.mode_info = ttk.Label(g, text="", style="Muted.Card.TLabel", wraplength=600)
         self.mode_info.grid(row=3, column=1, columnspan=3, sticky="w")
         self.trigger.trace_add("write", lambda *a: self._mode_changed())
+        fake = ttk.Frame(cfg, style="Card.TFrame")
+        fake.pack(fill="x", pady=(10, 0))
+        ttk.Label(fake, text="Fake recording (forge)", style="Label.Card.TLabel").pack(side="left", padx=(0, 12))
+        self.fake_path = tk.StringVar()
+        self.fake_entry = ttk.Entry(fake, textvariable=self.fake_path, style=f"{k}.TEntry")
+        self.fake_entry.pack(side="left", fill="x", expand=True)
+        self.fake_btn = ttk.Button(fake, text="Browse…", command=self._browse_fake)
+        self.fake_btn.pack(side="left", padx=(8, 0))
         foot = ttk.Frame(cfg, style="Card.TFrame")
         foot.pack(fill="x", pady=(12, 0))
         self.btn = ttk.Button(foot, text="Start relay", style=f"{k}.Accent.TButton", command=self.start)
@@ -668,7 +676,8 @@ class RelayApp(_QueuedApp):
         self.heard.bind("<Double-Button-1>", lambda e: self.play_intercepted())
         hb = ttk.Frame(hr, style="Card.TFrame")
         hb.pack(side="left", padx=(12, 0), anchor="n")
-        ttk.Button(hb, text="▶  Play", command=self.play_intercepted).pack(fill="x")
+        ttk.Button(hb, text="▶  Noise", command=self.play_intercepted).pack(fill="x")
+        ttk.Button(hb, text="▶  Decrypted", command=self.play_recovered).pack(fill="x", pady=(8, 0))
         ttk.Button(hb, text="■  Stop", command=audio.stop_playback).pack(fill="x", pady=(8, 0))
         ttk.Button(hb, text="Cryptanalysis lab…", command=lambda: open_lab(self.root)).pack(fill="x", pady=(8, 0))
 
@@ -677,9 +686,18 @@ class RelayApp(_QueuedApp):
         self.log.pack(fill="both", expand=True)
         self._refresh()
 
+    def _browse_fake(self):
+        p = filedialog.askopenfilename(filetypes=[("WAV audio", "*.wav")], initialdir="received")
+        if p:
+            self.fake_path.set(p)
+
     def _mode_changed(self):
-        text = MODE_INFO.get(self.mode.get(), "").format(n=self.trigger.get() or "?")
-        self.mode_info.configure(text=text, foreground=C["muted"] if self.mode.get() == "observe" else WARN)
+        mode = self.mode.get()
+        text = MODE_INFO.get(mode, "").format(n=self.trigger.get() or "?")
+        self.mode_info.configure(text=text, foreground=C["muted"] if mode == "observe" else WARN)
+        state = "normal" if mode == "forge" else "disabled"
+        self.fake_entry.configure(state=state)
+        self.fake_btn.configure(state=state)
 
     def _refresh(self):
         r = self.relay
@@ -705,7 +723,9 @@ class RelayApp(_QueuedApp):
             if items:
                 e = self._entropy_cache[1]
                 self.tiles["entropy"][0].configure(text=f"{e:.3f}", foreground=GOOD if e > 7.9 else WARN)
-            if r.done.is_set():
+            if r.cracked_pin:
+                self.pill.set(f"Cracked · PIN {r.cracked_pin}", WARN)
+            elif r.done.is_set():
                 self.pill.set("Finished", MUTED)
             elif items:
                 self.pill.set(f"Intercepting · {self.mode.get()}", WARN)
@@ -721,11 +741,40 @@ class RelayApp(_QueuedApp):
                   "noise only, the speech cannot be recovered without the session key")
         audio.play(m.as_pcm())
 
+    def play_recovered(self):
+        r = self.relay
+        if not r or not r.recovered:
+            self.post(self._append, self.log,
+                      "[relay] no decrypted voice yet – use crack or forge mode; the key is "
+                      "brute-forced and the audio recovered once the message has gone through")
+            return
+        sel = self.heard.curselection()
+        target = r.intercepted[sel[0]] if sel else None
+        pcm, rate = r.recovered[-1][1], r.recovered[-1][2]
+        for m, p, rt in r.recovered:
+            if m is target:
+                pcm, rate = p, rt
+                break
+        self.post(self._append, self.log,
+                  f"[relay] playing the DECRYPTED real voice ({len(pcm) / 2 / rate:.1f}s) – "
+                  f"recovered with the cracked PIN {r.cracked_pin}")
+        audio.play(pcm, rate)
+
     def start(self):
+        mode = self.mode.get()
+        fake_pcm, fake_rate = None, 16000
+        if mode == "forge":
+            try:
+                fake_pcm, fake_rate, _, width = audio.load_wav(self.fake_path.get())
+            except Exception as e:
+                messagebox.showerror("Fake recording",
+                                     f"Forge mode needs a WAV file to inject.\n\n{e}")
+                return
         try:
             relay = InspectionRelay(int(self.lport.get()), self.dhost.get().strip(),
-                                    int(self.dport.get()), self.mode.get(), int(self.trigger.get()),
-                                    on_log=lambda t: self.post(self._append, self.log, t))
+                                    int(self.dport.get()), mode, int(self.trigger.get()),
+                                    on_log=lambda t: self.post(self._append, self.log, t),
+                                    fake_pcm=fake_pcm, fake_rate=fake_rate)
         except ValueError as e:
             messagebox.showerror("Settings", str(e))
             return

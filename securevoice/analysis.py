@@ -10,11 +10,12 @@ Measures how much structure of the original voice survives each layer:
 
 Intended use: encrypt your own sample audio with 1, 2 and 3 layers and compare.
 """
+import hmac
 import math
 import os
 import time
 from collections import Counter
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -248,6 +249,45 @@ def ciphertext_only_attack(ct: bytes) -> dict:
                        f"picked {perm} (smoothness {score:.2f})" if ok else
                        f"best guesses a={a} b={b}, columns {perm} still look like noise "
                        f"(smoothness {score:.2f}): the statistics are gone")}
+
+
+# ---------------------------------------------------------------------------
+# Brute force of the passphrase (the attack against the real AES-256 system)
+# ---------------------------------------------------------------------------
+# AES-256-GCM itself cannot be broken, but its key is only as strong as the
+# passphrase behind it. If the two laptops share a short PIN, a man in the middle
+# who captured the handshake can try every PIN, derive the key the same way the
+# peers did, and check it against the handshake's HMAC proof. One match reveals
+# the key -> the attacker can decrypt the voice and forge new messages.
+def pin_candidates(digits: int = 4) -> Iterable[str]:
+    """All numeric PINs of the given length, e.g. '0000'..'9999' for 4 digits."""
+    fmt = "%0" + str(digits) + "d"
+    for i in range(10 ** digits):
+        yield fmt % i
+
+
+def brute_force_passphrase(name_i: str, name_r: str, nonce_i: bytes, nonce_r: bytes,
+                           received_proof: bytes, role: bytes = b"R",
+                           iterations: Optional[int] = None,
+                           candidates: Optional[Iterable[str]] = None) -> dict:
+    """Try each candidate passphrase against a captured handshake proof.
+
+    Returns {success, passphrase, aes_key, tries, secs}. On success the AES-256
+    session key is recovered, so the attacker can decrypt and forge."""
+    from . import protocol as P
+    from .keys import PBKDF2_ITERATIONS, proof as make_proof
+    iters = PBKDF2_ITERATIONS if iterations is None else iterations
+    cands = pin_candidates() if candidates is None else candidates
+    t = time.time()
+    tries = 0
+    for cand in cands:
+        tries += 1
+        akey, transcript, lk = P.recompute_session(cand, name_i, name_r, nonce_i, nonce_r, iters)
+        if hmac.compare_digest(make_proof(akey, role, transcript), received_proof):
+            return {"success": True, "passphrase": cand, "aes_key": lk.aes,
+                    "tries": tries, "secs": time.time() - t}
+    return {"success": False, "passphrase": None, "aes_key": None,
+            "tries": tries, "secs": time.time() - t}
 
 
 CASES = ("Affine", "Affine + Transposition", "Affine + Transposition + AES")
