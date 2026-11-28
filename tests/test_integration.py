@@ -288,3 +288,84 @@ def test_relay_forge_live_inject():
     assert hd.voices[0].pcm == fake and hd.voices[0].pcm != real
     assert not any("SECURITY" in l for l in hd.logs)
     src.close(); dst.close()
+
+
+def _send_async(peer, pcm):
+    def snd():
+        try:
+            peer.send_voice(pcm, RATE)
+        except OSError:
+            pass
+    threading.Thread(target=snd, daemon=True).start()
+
+
+def test_relay_forge_rearms_both_directions():
+    """Forge several messages in a row, in BOTH directions. After each injection the
+    relay must re-arm, and the forged frames must continue each direction's sequence
+    numbers -- a second fake on a direction that restarted at seq 0 would be rejected
+    as a replay (a SECURITY ALERT), giving the attack away. Nobody must see an alert."""
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")
+    dport, t, _ = start_dest(dst)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "forge", capture_dir=None, on_log=lambda s: None)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+
+    f1, f2, f3 = tone(0.5, 880), tone(0.5, 990), tone(0.5, 770)
+    # 1) source -> destination
+    _send_async(src, tone(1.0, 440))
+    assert wait_for(lambda: relay.source_transmitting, 8)
+    assert relay.inject_fake(f1, RATE)
+    assert wait_for(lambda: len(hd.voices) == 1, 8)
+    # 2) destination -> source (the reverse direction must forge too)
+    assert wait_for(lambda: not relay.source_transmitting, 5)
+    time.sleep(1.1)                                   # a gap starts a new intercepted message
+    _send_async(dst, tone(1.0, 550))
+    assert wait_for(lambda: relay.source_transmitting, 8)
+    assert relay.inject_fake(f2, RATE)
+    assert wait_for(lambda: len(hs.voices) == 1, 8)
+    # 3) source -> destination again: 2nd fake on A->B, seq must continue (no replay alert)
+    assert wait_for(lambda: not relay.source_transmitting, 5)
+    time.sleep(1.1)
+    _send_async(src, tone(1.0, 660))
+    assert wait_for(lambda: relay.source_transmitting, 8)
+    assert relay.inject_fake(f3, RATE)
+    assert wait_for(lambda: len(hd.voices) == 2, 8)
+
+    assert [m.pcm for m in hd.voices] == [f1, f3]      # destination got both forged clips, in order
+    assert [m.pcm for m in hs.voices] == [f2]          # source got the reverse-direction forgery
+    assert relay.injections == 3
+    assert not any("SECURITY" in l for l in hd.logs + hs.logs), "a forged message was rejected"
+    src.close(); dst.close()
+
+
+def test_relay_crack_plays_latest_across_directions():
+    """Decrypt must return messages in capture order, so the LAST entry is the most
+    recent one -- even when the newest message is on the opposite direction from the
+    previous one. (The bug: grouping by direction played a previous voice instead.)"""
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")
+    dport, t, _ = start_dest(dst)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "crack", capture_dir=None, on_log=lambda s: None)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+
+    m1, m2, m3 = tone(1.0, 300), tone(1.0, 500), tone(1.0, 700)
+    src.send_voice(m1, RATE)                           # A->B
+    assert wait_for(lambda: len(hd.voices) == 1, 8)
+    time.sleep(1.1)
+    dst.send_voice(m2, RATE)                           # B->A (other direction)
+    assert wait_for(lambda: len(hs.voices) == 1, 8)
+    time.sleep(1.1)
+    src.send_voice(m3, RATE)                           # A->B again -- the newest message
+    assert wait_for(lambda: len(hd.voices) == 2, 8)
+    src.close(); dst.close()
+    assert wait_for(lambda: relay.done.is_set(), 8)
+
+    recovered = relay.recover_all()
+    assert recovered[-1][1] == m3, "decrypt returned a previous voice, not the latest"
+    assert {pcm for _, pcm, _ in recovered} == {m1, m2, m3}   # and all three were recovered

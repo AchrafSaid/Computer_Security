@@ -622,7 +622,7 @@ class RelayApp(_QueuedApp):
         self.rec_start = None
         self.fake_pcm_recorded = None
         self.fake_rate_recorded = audio.SAMPLE_RATE
-        self._alerted = False
+        self._alerted = -1               # index of the last detection announced in the log
         self.pill = _header(root, self.accent, f"Man in the middle · inspection relay · this laptop {local_ip()}")
         self.pill.set("Idle", MUTED)
 
@@ -704,7 +704,7 @@ class RelayApp(_QueuedApp):
     def _live_forge(self):
         r = self.relay
         return bool(r and self.mode.get() == "forge"
-                    and getattr(r, "source_transmitting", False) and not r.injected)
+                    and getattr(r, "source_transmitting", False))
 
     def toggle_fake_record(self):
         if self.rec_start is None:
@@ -772,18 +772,20 @@ class RelayApp(_QueuedApp):
                 e = self._entropy_cache[1]
                 self.tiles["entropy"][0].configure(text=f"{e:.3f}", foreground=GOOD if e > 7.9 else WARN)
             transmitting = getattr(r, "source_transmitting", False)
-            if transmitting and not r.injected and not self._alerted:
-                self._alerted = True
+            detections = getattr(r, "detections", 0)
+            if transmitting and detections != self._alerted:
+                self._alerted = detections
                 self.post(self._append, self.log,
                           "[relay] ⚠ source detected and intercepted — press ●  Record to capture "
                           "your fake, then stop to inject it")
             if getattr(r, "cracking", False):
                 pct = int(r.crack_tries * 100 / max(r.crack_total, 1))
                 self.pill.set(f"Brute-forcing… {pct}%  ({r.crack_tries:,}/{r.crack_total:,})", WARN)
-            elif r.injected:
-                self.pill.set(f"Fake injected · PIN {r.cracked_pin}", WARN)
             elif transmitting:
                 self.pill.set("Source sending — record & inject!", BAD)
+            elif getattr(r, "injections", 0):
+                n = r.injections
+                self.pill.set(f"Fake injected ×{n} · PIN {r.cracked_pin}", WARN)
             elif r.cracked_pin:
                 self.pill.set(f"Cracked · PIN {r.cracked_pin}", WARN)
             elif r.done.is_set():
@@ -828,7 +830,7 @@ class RelayApp(_QueuedApp):
             if self.rec_start is not None:
                 messagebox.showerror("Fake recording", "Finish the recording first (press ■ Stop).")
                 return
-            self._alerted = False
+            self._alerted = -1
             path = self.fake_path.get()
             if self.fake_pcm_recorded:                     # a fake was prepared earlier
                 fake_pcm, fake_rate = self.fake_pcm_recorded, self.fake_rate_recorded
