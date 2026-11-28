@@ -32,7 +32,7 @@ also carries an end-to-end SHA-256 hash.
 
 > **The catch (this is the whole point).** AES-256-GCM cannot be broken. But its key
 > is only as strong as the passphrase. If the two laptops share a short PIN (e.g.
-> `1234`), a man in the middle who captured the handshake can try every PIN, derive
+> `12345`), a man in the middle who captured the handshake can try every PIN, derive
 > the key exactly as the peers did, and confirm it against the handshake's HMAC proof —
 > about 10,000 guesses, under a second. Then the attacker holds the key and can decrypt
 > and forge at will, undetected. A long passphrase cannot be guessed, so the attacker
@@ -63,8 +63,8 @@ All three laptops must be on the same network. Each GUI shows its own IP.
 | Middle (relay) | `.venv/bin/python run.py relay` | Listen `12347`, destination = Destination IP : `12348` |
 | Source | `.venv/bin/python run.py peer` | Role **Connect**, IP = relay IP, port `12347` |
 
-1. Type the same **Shared PIN** on the source and the destination. Use a 4-digit PIN
-   (e.g. `1234`) to demonstrate the attack, or a long passphrase to stay secure.
+1. Type the same **Shared PIN** on the source and the destination. Use a 5-digit PIN
+   (e.g. `12345`) to demonstrate the attack, or a long passphrase to stay secure.
    The relay does **not** need it.
 2. Start the destination, then the relay, then the source.
 3. Press **● Record**, speak for about 1 minute, then **■ Stop & Send**. Both directions
@@ -139,11 +139,15 @@ AES-256-GCM is not broken; the **key** is. The relay in `crack` / `forge` mode c
 handshake, tries every PIN, derives the key the same way the peers did, and confirms it
 against the handshake's HMAC proof.
 
-| Passphrase | Guesses | Time | Result |
+| Passphrase | Guesses | Time (demo settings) | Result |
 |---|---|---|---|
-| 4-digit PIN (`1234`) | ≤ 10,000 | < 1 s | **key recovered → decrypt + forge, undetected** |
-| 6-digit PIN | ≤ 1,000,000 | seconds–minutes | still broken |
+| 5-digit PIN (`12345`, the demo) | ≤ 100,000 | ~4–8 s | **key recovered → decrypt + forge, undetected** |
+| 4-digit PIN | ≤ 10,000 | < 1 s | broken instantly |
+| 6-digit PIN | ≤ 1,000,000 | ~40–80 s | still broken |
 | 12-char random passphrase | ~10²¹ | infeasible | **safe** — attacker never gets the key |
+
+(With the real PBKDF2 of 200,000 rounds each guess is ~200× slower, so even a 6-digit
+PIN would take hours — which is why key-stretching exists.)
 
 Because the attacker ends up with the real key, the forged message passes AES-GCM's tag
 check and the sequence check, so the destination accepts it and raises no alert. The same

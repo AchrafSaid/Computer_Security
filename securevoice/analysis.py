@@ -269,11 +269,15 @@ def pin_candidates(digits: int = 4) -> Iterable[str]:
 def brute_force_passphrase(name_i: str, name_r: str, nonce_i: bytes, nonce_r: bytes,
                            received_proof: bytes, role: bytes = b"R",
                            iterations: Optional[int] = None,
-                           candidates: Optional[Iterable[str]] = None) -> dict:
+                           candidates: Optional[Iterable[str]] = None,
+                           on_progress: Optional[Callable[[int], None]] = None,
+                           progress_every: int = 1000) -> dict:
     """Try each candidate passphrase against a captured handshake proof.
 
-    Returns {success, passphrase, aes_key, tries, secs}. On success the AES-256
-    session key is recovered, so the attacker can decrypt and forge."""
+    `on_progress(tries)` is called every `progress_every` guesses so a GUI can
+    show a live count. Returns {success, passphrase, aes_key, tries, secs}. On
+    success the AES-256 session key is recovered, so the attacker can decrypt and
+    forge."""
     from . import protocol as P
     from .keys import PBKDF2_ITERATIONS, proof as make_proof
     iters = PBKDF2_ITERATIONS if iterations is None else iterations
@@ -286,6 +290,8 @@ def brute_force_passphrase(name_i: str, name_r: str, nonce_i: bytes, nonce_r: by
         if hmac.compare_digest(make_proof(akey, role, transcript), received_proof):
             return {"success": True, "passphrase": cand, "aes_key": lk.aes,
                     "tries": tries, "secs": time.time() - t}
+        if on_progress and tries % progress_every == 0:
+            on_progress(tries)
     return {"success": False, "passphrase": None, "aes_key": None,
             "tries": tries, "secs": time.time() - t}
 

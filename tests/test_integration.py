@@ -178,11 +178,11 @@ def test_relay_attacks_detected(ids, mode, expected):
 
 
 # ------- Weak-key man-in-the-middle: brute-force the PIN, then decrypt / forge -------
-WEAK_PIN = "1234"
+WEAK_PIN = "12345"
 
 
 def test_relay_crack_recovers_original():
-    """Passive: with a 4-digit PIN the relay brute-forces the key and decrypts the
+    """Passive: with a short numeric PIN the relay brute-forces the key and decrypts the
     voice. The message still reaches the destination unchanged (nobody notices)."""
     hs, hd = Harness(), Harness()
     src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")

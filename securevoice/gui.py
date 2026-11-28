@@ -723,7 +723,10 @@ class RelayApp(_QueuedApp):
             if items:
                 e = self._entropy_cache[1]
                 self.tiles["entropy"][0].configure(text=f"{e:.3f}", foreground=GOOD if e > 7.9 else WARN)
-            if r.cracked_pin:
+            if getattr(r, "cracking", False):
+                pct = int(r.crack_tries * 100 / max(r.crack_total, 1))
+                self.pill.set(f"Brute-forcing… {pct}%  ({r.crack_tries:,}/{r.crack_total:,})", WARN)
+            elif r.cracked_pin:
                 self.pill.set(f"Cracked · PIN {r.cracked_pin}", WARN)
             elif r.done.is_set():
                 self.pill.set("Finished", MUTED)
@@ -743,22 +746,29 @@ class RelayApp(_QueuedApp):
 
     def play_recovered(self):
         r = self.relay
-        if not r or not r.recovered:
-            self.post(self._append, self.log,
-                      "[relay] no decrypted voice yet – use crack or forge mode; the key is "
-                      "brute-forced and the audio recovered once the message has gone through")
+        if not r:
             return
         sel = self.heard.curselection()
-        target = r.intercepted[sel[0]] if sel else None
-        pcm, rate = r.recovered[-1][1], r.recovered[-1][2]
-        for m, p, rt in r.recovered:
-            if m is target:
-                pcm, rate = p, rt
-                break
-        self.post(self._append, self.log,
-                  f"[relay] playing the DECRYPTED real voice ({len(pcm) / 2 / rate:.1f}s) – "
-                  f"recovered with the cracked PIN {r.cracked_pin}")
-        audio.play(pcm, rate)
+        idx = sel[0] if sel else None
+        target = r.intercepted[idx] if (idx is not None and idx < len(r.intercepted)) else None
+        self.post(self._append, self.log, "[relay] brute-forcing the PIN and decrypting…")
+        if not r.recovered:
+            self.post(self.pill.set, "Brute-forcing…", WARN)
+
+        def work():
+            recovered = r.recovered or r.recover_all()     # crack + decrypt on demand
+            if not recovered:
+                return                                     # recover_all() already logged why
+            pcm, rate = recovered[-1][1], recovered[-1][2]
+            for m, p, rt in recovered:
+                if m is target:
+                    pcm, rate = p, rt
+                    break
+            self.post(self._append, self.log,
+                      f"[relay] playing the DECRYPTED real voice ({len(pcm) / 2 / rate:.1f}s) – "
+                      f"recovered with the cracked PIN {r.cracked_pin}")
+            audio.play(pcm, rate)
+        threading.Thread(target=work, daemon=True).start()
 
     def start(self):
         mode = self.mode.get()

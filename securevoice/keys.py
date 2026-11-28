@@ -11,7 +11,7 @@ so every session gets a new key although the passphrase stays the same. Each sid
 proves it knows the passphrase with an HMAC-SHA256 over the handshake transcript;
 the passphrase itself is never sent.
 
-The voice is encrypted with AES-256-GCM only. A short passphrase (e.g. a 4-digit
+The voice is encrypted with AES-256-GCM only. A short passphrase (e.g. a 5-digit
 PIN) can be brute-forced from a captured handshake -- that weakness is the subject
 of the man-in-the-middle demonstration (see relay.py and analysis.py).
 """
@@ -29,7 +29,7 @@ TRANSPOSITION_COLS = 8
 NONCE_LEN = 16
 # Key-stretching rounds for PBKDF2. Real systems use >=200,000 to slow down
 # offline guessing. We use a small value so the brute-force MITM demo finishes in
-# a second or two; the lesson (a strong passphrase is still safe, a 4-digit PIN is
+# a second or two; the lesson (a strong passphrase is still safe, a short PIN is
 # not) does not depend on this number -- it is the size of the passphrase space.
 PBKDF2_ITERATIONS = 1_000
 MIN_PASSPHRASE_LEN = 12
