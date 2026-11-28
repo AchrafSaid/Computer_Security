@@ -642,9 +642,12 @@ class RelayApp(_QueuedApp):
         ttk.Label(g, text="Mode", style="Label.Card.TLabel").grid(row=2, column=0, sticky="w", pady=4)
         seg = ttk.Frame(g, style="Card.TFrame")
         seg.grid(row=2, column=1, columnspan=3, sticky="w", pady=4)
+        self.mode_btns = []
         for m in MODES:
-            ttk.Radiobutton(seg, text=m, value=m, variable=self.mode, style=f"{k}.Seg.Toolbutton",
-                            command=self._mode_changed).pack(side="left")
+            rb = ttk.Radiobutton(seg, text=m, value=m, variable=self.mode, style=f"{k}.Seg.Toolbutton",
+                                 command=self._mode_changed)
+            rb.pack(side="left")
+            self.mode_btns.append(rb)
         self.mode_info = ttk.Label(g, text="", style="Muted.Card.TLabel", wraplength=600)
         self.mode_info.grid(row=3, column=1, columnspan=3, sticky="w")
         self.trigger.trace_add("write", lambda *a: self._mode_changed())
@@ -664,6 +667,10 @@ class RelayApp(_QueuedApp):
         foot.pack(fill="x", pady=(12, 0))
         self.btn = ttk.Button(foot, text="Start relay", style=f"{k}.Accent.TButton", command=self.start)
         self.btn.pack(side="right")
+        self.stop_btn = ttk.Button(foot, text="Stop relay", command=self.stop_relay, state="disabled")
+        self.stop_btn.pack(side="right", padx=(0, 8))
+        ttk.Label(foot, text="One mode per run — stop the relay to switch mode",
+                  style="Muted.Card.TLabel").pack(side="left")
         self._mode_changed()
 
         tiles = ttk.Frame(root, padding=(16, 0, 16, 12))
@@ -851,6 +858,9 @@ class RelayApp(_QueuedApp):
             return
         self.relay, self._last_label = relay, ""
         self.btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        for rb in self.mode_btns:                          # mode is fixed for this run
+            rb.configure(state="disabled")
         self.pill.set(f"Listening on :{self.lport.get()}", WARN)
 
         def run():
@@ -859,8 +869,24 @@ class RelayApp(_QueuedApp):
             except Exception as e:
                 self.post(self._append, self.log, f"[relay] error: {e}")
                 self.post(self.pill.set, "Error", BAD)
-            self.post(lambda: self.btn.configure(state="normal"))
+            self.post(self._relay_stopped)
         threading.Thread(target=run, daemon=True).start()
+
+    def stop_relay(self):
+        r = self.relay
+        if not r:
+            return
+        self.stop_btn.configure(state="disabled")
+        self.post(self._append, self.log, "[relay] stopping — the peers will disconnect; reconnect "
+                  "them after you restart the relay (a new session resets the sequence numbers)")
+        threading.Thread(target=r.stop, daemon=True).start()
+
+    def _relay_stopped(self):
+        self.btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        for rb in self.mode_btns:
+            rb.configure(state="normal")
+        self._mode_changed()                               # restore the fake-row state for the mode
 
 
 # ---------------------------------------------------------------------------

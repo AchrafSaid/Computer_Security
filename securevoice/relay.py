@@ -134,6 +134,7 @@ class InspectionRelay:
         self.injected = False                # True once at least one fake has been sent
         self.detections = 0                  # how many transmissions have been intercepted
         self.injections = 0                  # how many fakes have been injected
+        self._src_sock = None                # source socket (a)
         self._dst_sock = None                # destination socket (b)
         self._forge_dst = None               # where the current fake goes
         self._forge_dir_byte = P.DIR_INITIATOR
@@ -381,6 +382,7 @@ class InspectionRelay:
         if ready:
             ready.set()
         a, addr = srv.accept()
+        self._src_sock = a
         self.on_log(f"[relay] source connected from {addr[0]}")
         b = socket.create_connection(self.dest)
         self._dst_sock = b
@@ -501,8 +503,18 @@ class InspectionRelay:
         return [raw]
 
     def stop(self) -> None:
-        if self._srv:
-            try:
-                self._srv.close()
-            except OSError:
-                pass
+        """Close the listener and both peer sockets so the pump threads end and
+        serve_once() returns. Lets the GUI stop a running relay on demand (e.g. to
+        switch mode), after which the peers reconnect through a fresh session."""
+        for s in (self._src_sock, self._dst_sock):          # unblock the pumps' recv()
+            if s:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        for s in (self._srv, self._src_sock, self._dst_sock):
+            if s:
+                try:
+                    s.close()
+                except OSError:
+                    pass

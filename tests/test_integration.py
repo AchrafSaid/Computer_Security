@@ -341,6 +341,43 @@ def test_relay_forge_rearms_both_directions():
     src.close(); dst.close()
 
 
+def test_relay_stop_then_observe_forwards():
+    """Switching mode is a fresh relay session: stop() must cleanly end a running
+    relay, and a new observe relay then forwards messages normally. (The bug: after
+    a forge the relay kept dropping, so 'observe' delivered nothing.)"""
+    # a forge session that injects a fake
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")
+    dport, t, _ = start_dest(dst)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "forge", capture_dir=None,
+                            on_log=lambda s: None, fake_pcm=tone(0.5, 880), fake_rate=RATE)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+    _send_async(src, tone(1.0, 440))
+    assert wait_for(lambda: hd.voices, 8)
+    relay.stop()                                           # user stops to switch mode
+    assert wait_for(lambda: relay.done.is_set(), 5)        # serve_once returned cleanly
+    src.close(); dst.close()
+
+    # a fresh observe relay with fresh peers forwards unchanged
+    hs2, hd2 = Harness(), Harness()
+    src2, dst2 = hs2.peer(WEAK_PIN, "alice"), hd2.peer(WEAK_PIN, "bob")
+    dport2, t2, _ = start_dest(dst2)
+    relay2 = InspectionRelay(0, "127.0.0.1", dport2, "observe", capture_dir=None, on_log=lambda s: None)
+    ready2 = threading.Event()
+    threading.Thread(target=relay2.serve_once, args=(ready2,), daemon=True).start()
+    ready2.wait(5)
+    src2.connect("127.0.0.1", relay2.listen_port); t2.join(5)
+    msg = tone(1.0, 400)
+    src2.send_voice(msg, RATE)
+    assert wait_for(lambda: hd2.voices, 8)
+    assert hd2.voices[0].pcm == msg                        # delivered unchanged
+    assert not any("SECURITY" in l for l in hd2.logs)
+    src2.close(); dst2.close()
+
+
 def test_relay_crack_plays_latest_across_directions():
     """Decrypt must return messages in capture order, so the LAST entry is the most
     recent one -- even when the newest message is on the opposite direction from the
