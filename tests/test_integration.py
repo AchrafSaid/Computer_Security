@@ -228,3 +228,32 @@ def test_relay_forge_injects_fake():
     src.close(); dst.close()
     assert wait_for(lambda: relay.done.is_set(), 8)
     assert relay.cracked_pin == WEAK_PIN
+
+
+def test_relay_forge_live_inject():
+    """Live forge: the relay starts with NO pre-staged fake. When the source
+    transmits, the relay detects it (source_transmitting); the attacker then
+    records a fake and injects it on demand, and the destination accepts it."""
+    hs, hd = Harness(), Harness()
+    src, dst = hs.peer(WEAK_PIN, "alice"), hd.peer(WEAK_PIN, "bob")
+    dport, t, _ = start_dest(dst)
+    relay = InspectionRelay(0, "127.0.0.1", dport, "forge", capture_dir=None, on_log=lambda s: None)
+    ready = threading.Event()
+    threading.Thread(target=relay.serve_once, args=(ready,), daemon=True).start()
+    ready.wait(5)
+    src.connect("127.0.0.1", relay.listen_port); t.join(5)
+    real = tone(2.0, 440)
+
+    def snd():
+        try:
+            src.send_voice(real, RATE)
+        except OSError:
+            pass
+    threading.Thread(target=snd, daemon=True).start()
+    assert wait_for(lambda: relay.source_transmitting, 8)   # relay detects the source sending
+    fake = tone(1.0, 880)
+    assert relay.inject_fake(fake, RATE)                     # attacker injects a different clip live
+    assert wait_for(lambda: hd.voices)
+    assert hd.voices[0].pcm == fake and hd.voices[0].pcm != real
+    assert not any("SECURITY" in l for l in hd.logs)
+    src.close(); dst.close()

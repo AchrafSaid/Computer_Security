@@ -128,6 +128,11 @@ class InspectionRelay:
         self._cracked = False
         self._crack_failed = False
         self._forged = False
+        self.source_transmitting = False     # True once the real source starts sending (forge)
+        self.injected = False                # True once a fake has been sent to the destination
+        self._dst_sock = None                # destination socket, so a fake can be injected later
+        self._inject_lock = threading.Lock()
+        self._crack_lock = threading.Lock()
         self.cracked_pin: Optional[str] = None
         self.aes_key: Optional[bytes] = None
         self.recovered = []              # list[(Intercepted, pcm, rate)] after a crack
@@ -175,6 +180,12 @@ class InspectionRelay:
         """Brute-force the PIN from the captured handshake (once). Returns the AES key."""
         if self._cracked:
             return self.aes_key
+        with self._crack_lock:
+            if self._cracked:                            # another thread just cracked it
+                return self.aes_key
+            return self._do_crack()
+
+    def _do_crack(self) -> Optional[bytes]:
         if self._crack_failed or not self._handshake_ready():
             return None
         h = dict(self._hs)
@@ -206,16 +217,25 @@ class InspectionRelay:
                     f"({r['tries']:,} guesses, {r['secs']:.1f}s) — AES-256 key recovered ***")
         return self.aes_key
 
-    def _send_forged_message(self, dst: socket.socket) -> None:
-        """Encrypt the attacker's fake PCM with the recovered key and send it to the
-        destination as DIR_INITIATOR, seq 0.., so it looks like the real source."""
+    def inject_fake(self, pcm: bytes, rate: int = 16000) -> bool:
+        """Send the attacker's fake message to the destination, encrypted with the
+        recovered key as DIR_INITIATOR (seq 0..), so it looks like the real source.
+        Called live from the GUI once the attacker has recorded a fake. One per run."""
+        with self._inject_lock:
+            if self.injected:
+                return False
+            key = self._ensure_cracked()
+            if not key or not self._dst_sock or not pcm:
+                return False
+            self._emit_forged(self._dst_sock, pcm, rate)
+            self.injected = True
+            return True
+
+    def _emit_forged(self, dst: socket.socket, pcm: bytes, rate: int) -> None:
         from .peer import K_BEGIN, K_CHUNK, K_END, CHUNK
         from .crypto_layers import AESLayer
         import hashlib
-        key = self._ensure_cracked()
-        if not key or not self.fake_pcm:
-            return
-        aes = AESLayer(key)
+        aes = AESLayer(self.aes_key)
         seq = 0
 
         def emit(pt: bytes):
@@ -225,8 +245,7 @@ class InspectionRelay:
             P.send_frame(dst, P.T_DATA, seq.to_bytes(8, "big") + ct)
             seq += 1
 
-        pcm = self.fake_pcm
-        meta = {"id": 1, "rate": self.fake_rate, "channels": 1, "width": 2,
+        meta = {"id": 1, "rate": rate, "channels": 1, "width": 2,
                 "size": len(pcm), "sha256": hashlib.sha256(pcm).hexdigest()}
         emit(bytes([K_BEGIN]) + json.dumps(meta).encode())
         mid = (1).to_bytes(4, "big")
@@ -300,6 +319,7 @@ class InspectionRelay:
         a, addr = srv.accept()
         self.on_log(f"[relay] source connected from {addr[0]}")
         b = socket.create_connection(self.dest)
+        self._dst_sock = b
         self.on_log("[relay] connected to destination")
         if self.capture_dir:
             os.makedirs(self.capture_dir, exist_ok=True)
@@ -324,9 +344,6 @@ class InspectionRelay:
         data_count = 0
         history = []
         forging = apply_mode and self.mode == "forge"
-        if forging and not self.fake_pcm:
-            self.on_log("[relay] forge mode needs a fake recording; forwarding unchanged instead")
-            forging = False
         try:
             while True:
                 chunk = src.recv(65536)
@@ -352,11 +369,16 @@ class InspectionRelay:
                             self.on_log(f"[relay] {label} DATA seq={seq} {len(ct)}B "
                                         f"entropy={shannon_entropy(ct):.3f} bits/byte")
                         if forging:
-                            # drop the real message; on the first frame, inject the fake one
+                            # drop the real message; the attacker records and injects a fake
                             out = []
                             if not self._forged:
                                 self._forged = True
-                                self._send_forged_message(dst)
+                                self.source_transmitting = True
+                                self.on_log("[relay] *** SOURCE IS TRANSMITTING — intercepting and "
+                                            "dropping the real message; record a fake and inject it ***")
+                                self._ensure_cracked()
+                                if self.fake_pcm:        # pre-staged fake: inject right away
+                                    self.inject_fake(self.fake_pcm, self.fake_rate)
                         elif apply_mode and data_count == self.trigger_frame:
                             out = self._apply(raw, history)
                         history.append(raw)

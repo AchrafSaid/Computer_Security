@@ -606,7 +606,7 @@ MODE_INFO = {
     "tamper": "Active · flips one bit in DATA frame #{n} · with a strong key the receiver rejects it (integrity check)",
     "replay": "Active · re-sends an earlier frame at DATA frame #{n} · the receiver rejects it (sequence check)",
     "drop": "Active · deletes DATA frame #{n} · the receiver rejects the message (missing frame)",
-    "forge": "Active · brute-forces the PIN, drops the real message and sends your fake recording · the receiver accepts it as genuine",
+    "forge": "Active · detects the source, drops the real message, and injects a fake you record live · the receiver accepts it as genuine",
 }
 
 
@@ -622,6 +622,7 @@ class RelayApp(_QueuedApp):
         self.rec_start = None
         self.fake_pcm_recorded = None
         self.fake_rate_recorded = audio.SAMPLE_RATE
+        self._alerted = False
         self.pill = _header(root, self.accent, f"Man in the middle · inspection relay · this laptop {local_ip()}")
         self.pill.set("Idle", MUTED)
 
@@ -700,6 +701,11 @@ class RelayApp(_QueuedApp):
             self.fake_path.set(p)
             self.fake_pcm_recorded = None          # a chosen file overrides any recording
 
+    def _live_forge(self):
+        r = self.relay
+        return bool(r and self.mode.get() == "forge"
+                    and getattr(r, "source_transmitting", False) and not r.injected)
+
     def toggle_fake_record(self):
         if self.rec_start is None:
             try:
@@ -708,18 +714,24 @@ class RelayApp(_QueuedApp):
                 messagebox.showerror("Microphone", str(e))
                 return
             self.rec_start = time.time()
-            self.fake_rec_btn.configure(text="■  Stop")
+            self.fake_rec_btn.configure(text="■  Stop & inject" if self._live_forge() else "■  Stop")
             self.fake_timer.configure(foreground=BAD)
             self._fake_tick()
         else:
             pcm = self.recorder.stop()
             self.rec_start = None
             self.fake_rec_btn.configure(text="●  Record")
-            self.fake_pcm_recorded = pcm
-            self.fake_rate_recorded = audio.SAMPLE_RATE
             secs = len(pcm) / (audio.SAMPLE_RATE * audio.SAMPLE_WIDTH)
-            self.fake_path.set(f"[recorded {secs:.1f}s from mic]")
-            self.fake_timer.configure(text=f"{secs:.1f}s ready", foreground=C["muted"])
+            if self._live_forge():                        # source is transmitting: inject now
+                r = self.relay
+                self.post(self._append, self.log, f"[relay] injecting your {secs:.1f}s fake message now…")
+                threading.Thread(target=lambda: r.inject_fake(pcm, audio.SAMPLE_RATE), daemon=True).start()
+                self.fake_timer.configure(text=f"{secs:.1f}s injected", foreground=C["muted"])
+            else:                                         # otherwise stage it for later
+                self.fake_pcm_recorded = pcm
+                self.fake_rate_recorded = audio.SAMPLE_RATE
+                self.fake_path.set(f"[recorded {secs:.1f}s from mic]")
+                self.fake_timer.configure(text=f"{secs:.1f}s ready", foreground=C["muted"])
 
     def _fake_tick(self):
         if self.rec_start is not None:
@@ -759,9 +771,19 @@ class RelayApp(_QueuedApp):
             if items:
                 e = self._entropy_cache[1]
                 self.tiles["entropy"][0].configure(text=f"{e:.3f}", foreground=GOOD if e > 7.9 else WARN)
+            transmitting = getattr(r, "source_transmitting", False)
+            if transmitting and not r.injected and not self._alerted:
+                self._alerted = True
+                self.post(self._append, self.log,
+                          "[relay] ⚠ source detected and intercepted — press ●  Record to capture "
+                          "your fake, then stop to inject it")
             if getattr(r, "cracking", False):
                 pct = int(r.crack_tries * 100 / max(r.crack_total, 1))
                 self.pill.set(f"Brute-forcing… {pct}%  ({r.crack_tries:,}/{r.crack_total:,})", WARN)
+            elif r.injected:
+                self.pill.set(f"Fake injected · PIN {r.cracked_pin}", WARN)
+            elif transmitting:
+                self.pill.set("Source sending — record & inject!", BAD)
             elif r.cracked_pin:
                 self.pill.set(f"Cracked · PIN {r.cracked_pin}", WARN)
             elif r.done.is_set():
@@ -811,19 +833,19 @@ class RelayApp(_QueuedApp):
         fake_pcm, fake_rate = None, 16000
         if mode == "forge":
             if self.rec_start is not None:
-                messagebox.showerror("Fake recording", "Finish the fake recording first (press ■ Stop).")
+                messagebox.showerror("Fake recording", "Finish the recording first (press ■ Stop).")
                 return
-            if self.fake_pcm_recorded:
+            self._alerted = False
+            path = self.fake_path.get()
+            if self.fake_pcm_recorded:                     # a fake was prepared earlier
                 fake_pcm, fake_rate = self.fake_pcm_recorded, self.fake_rate_recorded
-            else:
+            elif path and not path.startswith("["):        # a WAV file was chosen
                 try:
-                    fake_pcm, fake_rate, _, width = audio.load_wav(self.fake_path.get())
+                    fake_pcm, fake_rate, _, _ = audio.load_wav(path)
                 except Exception as e:
-                    messagebox.showerror("Fake recording",
-                                         "Forge mode needs a message to inject.\n"
-                                         "Record one here with ●  Record, or pick a WAV with Browse…\n\n"
-                                         f"{e}")
+                    messagebox.showerror("Fake recording", f"Cannot load that WAV:\n{e}")
                     return
+            # else: no fake yet — record it live when the source starts transmitting
         try:
             relay = InspectionRelay(int(self.lport.get()), self.dhost.get().strip(),
                                     int(self.dport.get()), mode, int(self.trigger.get()),
